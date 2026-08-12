@@ -1,0 +1,451 @@
+<div id="anchor_memory_workbench" class="anchor-memory-settings am-workbench-shell" aria-hidden="true">
+  <div class="am-workbench-backdrop" data-am-close="1"></div>
+  <div class="am-workbench" role="dialog" aria-modal="true" aria-label="锚点书">
+    <div class="am-workbench-header">
+      <div class="am-workbench-title">
+        <span class="am-logo-letter" aria-hidden="true">a</span>
+        <b>锚点书 Anchor Memory</b>
+        <span id="am_master_state_badge" class="am-master-state-badge">运行中</span>
+      </div>
+      <div class="am-workbench-header-actions">
+        <button id="am_master_toggle" class="am-master-toggle" type="button" title="一键暂停锚点书；记忆数据和设置都会保留" aria-pressed="true">
+          <i class="fa-solid fa-power-off" aria-hidden="true"></i>
+          <span>暂停插件</span>
+        </button>
+        <button id="am_close_workbench" class="am-icon-button" title="关闭锚点书" aria-label="关闭锚点书">
+          <i class="fa-solid fa-xmark"></i>
+        </button>
+      </div>
+    </div>
+    <div class="am-workbench-content">
+      <div class="am-tabs">
+        <button class="am-tab active" data-tab="dashboard">总览</button>
+        <button class="am-tab" data-tab="timeline">记忆库</button>
+        <button class="am-tab am-advanced-tab" data-tab="characters">人物动态</button>
+        <button class="am-tab am-advanced-tab" data-tab="relationships">人物关系</button>
+        <button class="am-tab am-advanced-tab" data-tab="items">物品</button>
+        <button class="am-tab" data-tab="recall">召回</button>
+        <button class="am-tab" data-tab="archive">档案</button>
+        <button class="am-tab" data-tab="settings">设置 / API</button>
+        <button id="am_toggle_advanced_tabs" class="am-tab am-more-tab" type="button" aria-expanded="false">更多功能</button>
+        <button class="am-tab am-advanced-tab" data-tab="prompts">提示词</button>
+        <button class="am-tab am-advanced-tab" data-tab="summaries">逐楼摘要</button>
+        <button class="am-tab am-advanced-tab" data-tab="scenes">场景</button>
+        <button class="am-tab am-advanced-tab" data-tab="tools">工具</button>
+      </div>
+
+      <section class="am-tab-panel active" data-panel="dashboard">
+        <div class="am-note am-onboarding-note">
+          <b>第一次用？</b> 填副API → 正常聊天 → 需要换开场时保存“记忆档案”。其余功能都可先不管。
+        </div>
+        <div class="am-hero">
+          <div>
+            <div class="am-kicker">当前角色记忆</div>
+            <div id="am_status" class="am-status"></div>
+          </div>
+          <div class="am-actions">
+            <button id="am_force_anchor" title="把当前尚未锚定的有效摘要立即生成一个新的分段锚点">生成新锚点</button>
+            <button id="am_force_merge" title="把当前尚未纳入累计历史的内容立即整理进新的累计历史">合并到累计历史</button>
+            <button id="am_rewrite_latest_anchor" title="按原覆盖楼层重新生成最近一次分段锚点；不会增加编号">重写最近锚点</button>
+            <button id="am_rewrite_latest_merge" title="按原覆盖边界重新生成最近一次累计历史；不会增加编号">重写最近累计历史</button>
+            <button id="am_batch_init">初始化历史楼层</button>
+            <button id="am_health_check">记忆体检</button>
+            <button id="am_open_api_settings">填写API</button>
+          </div>
+        </div>
+
+        <div id="am_last_error_card" class="am-note am-warning-text" hidden></div>
+
+        <div class="am-stat-grid">
+          <div class="am-stat"><b id="am_stat_godlogs">0</b><span>逐楼摘要</span></div>
+          <div class="am-stat"><b id="am_stat_anchors">0</b><span>分段锚点</span></div>
+          <div class="am-stat"><b id="am_stat_merges">0</b><span>累计历史</span></div>
+          <div class="am-stat"><b id="am_stat_pending_summaries">0</b><span>等待生成摘要</span></div>
+          <div class="am-stat"><b id="am_stat_pending">0</b><span>已完成·等待锚点</span></div>
+          <div class="am-stat"><b id="am_stat_godlog_issues">0</b><span>需要修复</span></div>
+          <div class="am-stat"><b id="am_stat_vectors">0</b><span>已存向量</span></div>
+          <div class="am-stat"><b id="am_stat_tokens">0</b><span>记忆估算Token</span></div>
+        </div>
+
+        <div class="am-note" id="am_context_window">
+          原文窗口等待下次生成时统计。
+        </div>
+
+        <div class="am-note">
+          顶部“暂停插件 / 启动插件”是总开关。暂停后不注入记忆、不裁剪旧正文、不发起摘要/锚点/召回请求；已有记忆、API配置与档案全部保留，重新启动后继续使用。
+        </div>
+
+        <div id="am_health_list" class="am-card-list"></div>
+      </section>
+
+      <section class="am-tab-panel" data-panel="summaries">
+        <div class="am-toolbar">
+          <input id="am_godlog_search" class="text_pole" type="text" placeholder="搜索逐楼摘要、人物、地点、原话..." />
+          <button id="am_generate_missing_godlogs">自动补写缺失摘要</button>
+        </div>
+        <div class="am-note">缺失摘要会自动重试；如果某楼失败或落后，点“自动补写缺失摘要”或卡片里的“重跑本楼摘要”，插件会调用模型补写，不需要手写。</div>
+        <div id="am_godlog_list" class="am-card-list"></div>
+        <label>选中摘要
+          <textarea id="am_godlog_detail" class="am-preview text_pole"></textarea>
+        </label>
+        <div class="am-actions">
+          <button id="am_save_selected_godlog">保存选中摘要</button>
+          <button id="am_rerun_selected_godlog">重跑选中摘要</button>
+          <button id="am_delete_selected_godlog">删除选中摘要</button>
+        </div>
+      </section>
+
+      <section class="am-tab-panel" data-panel="timeline">
+        <div class="am-toolbar">
+          <input id="am_timeline_search" class="text_pole" type="text" placeholder="搜索锚点、人物、物品、原话..." />
+          <button id="am_refresh_view">刷新</button>
+        </div>
+        <div class="am-note">重写会保留原编号与原覆盖范围，不会新增一条记录。重写旧分段锚点会回滚依赖它的累计历史；重写旧累计历史会回滚其后的历史记录，随后由后台按顺序补建。生成失败时旧版本不会丢失。</div>
+        <div class="am-section-title">分段锚点区（生成间隔以设置页为准）</div>
+        <div id="am_new_anchor_list" class="am-card-list"></div>
+        <div class="am-section-title">累计历史区（合并间隔以设置页为准）</div>
+        <div id="am_old_anchor_list" class="am-card-list"></div>
+        <div id="am_timeline_list" class="am-card-list"></div>
+        <label>选中内容
+          <textarea id="am_timeline_detail" class="am-preview text_pole"></textarea>
+        </label>
+        <div class="am-actions">
+          <button id="am_save_selected_memory">保存选中锚点/合并</button>
+          <button id="am_rewrite_selected_memory">重写选中锚点/合并</button>
+          <button id="am_delete_selected_memory">删除选中锚点/合并</button>
+        </div>
+      </section>
+
+      <section class="am-tab-panel" data-panel="characters">
+        <div class="am-note">逐楼摘要完成后会自动刷新这里；不需要等分段锚点。安全重建会按最多10楼一段顺序处理并保存进度，失败、超时或刷新后可从未完成分段继续；全部分段完整通过前不会覆盖最后一次有效索引。连续三次无进展失败后会暂停自动重试，避免死循环扣费。</div>
+        <div id="am_codex_status" class="am-note">正在读取索引状态……</div>
+        <div class="am-actions">
+          <button id="am_rebuild_codex">安全重建人物/物品/场景索引</button>
+          <button id="am_restore_codex_backup">恢复上一次索引备份</button>
+        </div>
+        <div class="am-panel">
+          <div class="am-note">追踪规则：单角色卡自动使用当前 {{char}}；SillyTavern 群聊自动读取当前群组成员；单卡内含多个主角时，请在这里逐行填写角色名。人物纪要会在代码层过滤 {{user}} 和 NPC，不再只依赖提示词。</div>
+          <label>人物纪要追踪角色名单（每行一个；留空=自动）
+            <textarea id="am_tracked_characters" class="am-preview text_pole" rows="3" placeholder="例如：
+主角A
+主角B"></textarea>
+          </label>
+          <div class="am-actions">
+            <button id="am_save_tracked_characters" type="button">保存追踪名单并安全重建</button>
+          </div>
+          <div id="am_tracked_characters_status" class="am-note"></div>
+        </div>
+        <div id="am_character_memo_title" class="am-section-title">角色成长纪要</div>
+        <div id="am_character_cards" class="am-card-list"></div>
+        <div class="am-section-title">出场人物数据库</div>
+        <div id="am_people_cards" class="am-card-list"></div>
+        <details class="am-editor">
+          <summary>手动编辑人物记忆</summary>
+          <label>人物纪要 Markdown
+            <textarea id="am_character_memo_edit" class="am-preview text_pole"></textarea>
+          </label>
+          <label>出场人物库 Markdown
+            <textarea id="am_people_edit" class="am-preview text_pole"></textarea>
+          </label>
+          <button id="am_save_character_edits">保存人物编辑</button>
+        </details>
+      </section>
+
+      <section class="am-tab-panel" data-panel="relationships">
+        <div class="am-note">
+          这是固定名单关系表：AI只能填写既有行的“过去 / 发展 / 当前”，不能自行增加、删除或改名。第一行自动绑定 <b data-am-macro-template="{{char}}">{{char}}</b>；每一行都追踪该人物与 <b data-am-macro-template="{{user}}">{{user}}</b> 的关系。注意：增加关系行不会自动把该人物加入“人物动态”白名单；多人主角还需在“人物动态”页填写追踪名单。
+        </div>
+        <div class="am-note">
+          编辑、swipe、regenerate 或删楼后，关系表会先回退到更早快照，再按当前仍有效的逐楼摘要重建；例如从第68楼删回第23楼，最终只保留第23楼之前已经发生的关系发展。
+        </div>
+        <div id="am_relationship_status" class="am-note">正在读取人物关系表……</div>
+        <div class="am-relationship-table-wrap">
+          <table class="am-relationship-table">
+            <thead>
+              <tr><th>名称</th><th>过去</th><th>发展</th><th>当前</th><th>操作</th></tr>
+            </thead>
+            <tbody id="am_relationship_rows"></tbody>
+          </table>
+        </div>
+        <div class="am-actions am-relationship-actions">
+          <input id="am_relationship_new_name" class="text_pole" type="text" placeholder="输入要固定追踪关系的人物名；多人主角还需加入人物动态白名单" />
+          <button id="am_add_relationship_row" type="button">增加固定关系行</button>
+          <button id="am_save_relationship_rows" type="button">保存固定名单</button>
+          <button id="am_rebuild_relationship" type="button">按当前楼层重建关系</button>
+        </div>
+      </section>
+
+      <section class="am-tab-panel" data-panel="items">
+        <div id="am_item_cards" class="am-card-list"></div>
+        <details class="am-editor">
+          <summary>手动编辑物品/梗/伏笔</summary>
+          <textarea id="am_items_edit" class="am-preview text_pole"></textarea>
+          <button id="am_save_item_edits">保存物品编辑</button>
+        </details>
+      </section>
+
+      <section class="am-tab-panel" data-panel="scenes">
+        <div class="am-stat-grid">
+          <div class="am-stat"><b id="am_current_time">未明</b><span>当前时间</span></div>
+          <div class="am-stat"><b id="am_current_place">未明</b><span>当前地点</span></div>
+        </div>
+        <div id="am_timeline_health" class="am-note">
+          时间连续性会根据逐楼摘要自动核对；回忆、梦境和转述不会覆盖当前现实时间。
+        </div>
+        <div class="am-grid">
+          <label>修正当前剧情时间
+            <input id="am_current_time_edit" class="text_pole" type="text" placeholder="例如：未明 / 深夜 / 2025年3月15日 23:40" />
+          </label>
+          <label>修正当前剧情地点
+            <input id="am_current_place_edit" class="text_pole" type="text" placeholder="例如：未明 / 公寓客厅 / 巷口" />
+          </label>
+        </div>
+        <div id="am_scene_cards" class="am-card-list"></div>
+        <details class="am-editor">
+          <summary>手动编辑场景记录</summary>
+          <textarea id="am_scenes_edit" class="am-preview text_pole"></textarea>
+          <button id="am_save_scene_edits">保存场景编辑</button>
+        </details>
+      </section>
+
+      <section class="am-tab-panel" data-panel="recall">
+        <div class="am-note">
+          这里显示“下一次生成实际会发送给主模型的记忆块”。固定顺序为：人物关系 → 累计历史与其后的分段锚点 → 追踪角色动态 → 匹配到的出场人物 → 重要物品 → 尚未进入锚点的逐楼摘要。开启动态召回后，检索对象优先是过去的逐楼摘要；某一旧楼没有摘要时才使用原楼正文保底。检索查询优先读取当前消息里的 <content>…</content> 或 <context>…</context>；没有这些标签时会先剔除 Think / analysis / reasoning 等元数据块，再读取普通正文。开启向量后，语义相似度与关键词/实体命中会并行计算并融合排序。
+        </div>
+        <label>完整拼接预览（最终发送给主模型的六段结构）
+          <textarea id="am_core_preview" class="am-preview text_pole" readonly></textarea>
+        </label>
+        <label><span id="am_recall_preview_title">第六段：未锚定摘要 / 可选旧楼召回（当前）</span>
+          <div id="am_recall_preview_note" class="am-note" style="display:none;">
+            这里显示的是你点选某条 AI 消息后的历史注入快照。它不会因后来生成锚点而回溯更新，也不等于当前下一次生成会带入这些内容。
+            <button id="am_clear_recall_selection" type="button" style="display:none; margin-left:8px;">返回当前召回</button>
+          </div>
+          <textarea id="am_recall_preview" class="am-preview text_pole" readonly></textarea>
+        </label>
+        <div class="am-section-title">动态召回：检索条件与命中内容</div>
+        <div id="am_recall_hits" class="am-card-list"></div>
+      </section>
+
+      <section class="am-tab-panel" data-panel="archive">
+        <div class="am-note">
+          记忆档案先保存普通快照，随后在档案卡片点击“补齐并整理为累计历史”。插件会补齐当前聊天的缺失逐楼摘要，把尚未进入累计历史的内容完成最终整理，再生成可安全转档的版本。转档版只带入最终累计历史、人物关系、人物、物品和场景状态，不带入旧逐楼摘要与旧分段锚点，因此新开场可从第1楼独立计数。
+        </div>
+        <div class="am-actions">
+          <input id="am_archive_name" class="text_pole" type="text" placeholder="档案名，如 主线 / IF旅馆 / 黑化分支" />
+          <button id="am_save_archive">保存当前快照</button>
+        </div>
+        <div id="am_archive_cards" class="am-card-list"></div>
+      </section>
+
+      <section class="am-tab-panel" data-panel="prompts">
+        <div class="am-toolbar">
+          <select id="am_prompt_preset" class="text_pole">
+            <option value="classic">古法锚点（推荐）</option>
+            <option value="strict">严格保真</option>
+            <option value="compact">省Token</option>
+          </select>
+          <button id="am_apply_prompt_preset">套用预设</button>
+          <button id="am_save_prompts">保存提示词</button>
+          <button id="am_reset_prompts">恢复默认</button>
+        </div>
+        <label>逐楼摘要 Godlog 提示词
+          <textarea id="am_godlog_rules" class="am-prompt text_pole"></textarea>
+        </label>
+        <label>分段锚点提示词规则（实际间隔见运行设置）
+          <textarea id="am_anchor_rules" class="am-prompt text_pole"></textarea>
+        </label>
+        <label>累计历史合并提示词规则（技术格式，实际间隔见运行设置）
+          <textarea id="am_merge_rules" class="am-prompt text_pole"></textarea>
+        </label>
+        <label>人物动态演变提示词
+          <textarea id="am_character_rules" class="am-prompt text_pole"></textarea>
+        </label>
+        <label>出场人物数据库提示词
+          <textarea id="am_people_rules" class="am-prompt text_pole"></textarea>
+        </label>
+        <label>物品 / 细节 / 内部梗提示词
+          <textarea id="am_item_rules" class="am-prompt text_pole"></textarea>
+        </label>
+        <label>Godlog 固定表单结构（只读）
+          <textarea id="am_godlog_format" class="am-preview text_pole" readonly></textarea>
+        </label>
+        <label>分段锚点固定表单结构（只读）
+          <textarea id="am_anchor_format" class="am-preview text_pole" readonly></textarea>
+        </label>
+        <label>累计历史固定表单结构（只读）
+          <textarea id="am_merge_format" class="am-preview text_pole" readonly></textarea>
+        </label>
+      </section>
+
+      <section class="am-tab-panel" data-panel="settings">
+        <div class="am-section-title">第一步：填写副API</div>
+        <div class="am-note">
+          副API只负责后台写逐楼摘要、分段锚点、累计历史和人物/物品/场景索引；这些后台整理提示词不会发送给主模型。普通使用只需要填写这里。
+        </div>
+
+        <label class="checkbox_label">
+          <input id="am_use_secondary" type="checkbox" />
+          启用副API后台写记忆
+        </label>
+        <div id="am_secondary_fields" class="am-panel am-panel-visible">
+          <div class="am-api-preset-box">
+            <label>已保存的副API预设
+              <select id="am_secondary_preset_select" class="text_pole">
+                <option value="">不使用已保存预设</option>
+              </select>
+            </label>
+            <label>预设名称
+              <input id="am_secondary_preset_name" class="text_pole" type="text" maxlength="60" placeholder="例如：硅基流动 / OpenRouter / 备用API" />
+            </label>
+            <div class="am-actions am-preset-actions">
+              <button id="am_save_secondary_preset" type="button">保存为新预设</button>
+              <button id="am_update_secondary_preset" type="button">覆盖所选预设</button>
+              <button id="am_delete_secondary_preset" type="button">删除所选预设</button>
+            </div>
+            <div id="am_secondary_preset_status" class="am-preset-status">尚未保存副API预设。</div>
+            <div class="am-note">
+              预设会保存在当前SillyTavern的Anchor Memory扩展设置中，包含URL、密钥、当前模型和模型列表，可在所有聊天间切换使用。为了避免泄露，插件的“导出配置”不会导出密钥或这些预设。
+            </div>
+          </div>
+          <label>副API地址
+            <input id="am_secondary_url" class="text_pole" type="text" placeholder="https://api.example.com/v1 或 https://api.example.com/v1/chat/completions" />
+          </label>
+          <label>副API密钥
+            <input id="am_secondary_key" class="text_pole" type="password" placeholder="sk-..." />
+          </label>
+          <label>副API模型
+            <input id="am_secondary_model" class="text_pole" type="text" list="am_secondary_model_options" placeholder="先点拉取模型，或手动输入模型名" />
+            <datalist id="am_secondary_model_options"></datalist>
+          </label>
+          <div class="am-actions">
+            <button id="am_fetch_secondary_models" type="button">拉取副API模型</button>
+            <button id="am_test_secondary" type="button">测试副API</button>
+          </div>
+          <div class="am-note">
+            每次点击“拉取副API模型”都会先清空旧模型栏，再读取当前手机输入框中的地址与密钥；插件优先通过酒馆后端代理拉取，失败后才尝试浏览器直连。拉取失败时模型栏保持为空，不会继续误用旧模型。
+          </div>
+        </div>
+
+        <div class="am-section-title">第二步：填写向量API（可选）</div>
+        <div class="am-note">
+          向量API只服务于可选的“额外旧楼动态召回”，不影响逐楼摘要、分段锚点和累计历史。开启向量后，embedding 语义相似度会与本地关键词/实体命中同时参与融合排序；不是等向量失败后才做关键词搜索。召回优先使用过去已经生成的逐楼摘要；某一旧楼没有摘要时，关键词通道可用该楼原正文作为保底。
+        </div>
+
+        <label class="checkbox_label">
+          <input id="am_use_embedding" type="checkbox" />
+          启用语义向量召回（与关键词/实体融合）
+        </label>
+        <div id="am_embedding_fields" class="am-panel am-panel-visible">
+          <div class="am-actions">
+            <button id="am_apply_siliconflow_embedding" type="button">硅基流动向量配置</button>
+            <button id="am_fetch_embedding_models" type="button">拉取向量模型</button>
+          </div>
+          <label>向量API地址（留空则复用副API地址）
+            <input id="am_embedding_url" class="text_pole" type="text" placeholder="https://api.siliconflow.cn/v1" />
+          </label>
+          <label>向量API密钥（留空则复用副API密钥）
+            <input id="am_embedding_key" class="text_pole" type="password" placeholder="sk-..." />
+          </label>
+          <div class="am-grid">
+            <label>向量模型
+              <input id="am_embedding_model" class="text_pole" type="text" list="am_embedding_model_options" placeholder="BAAI/bge-m3" />
+              <datalist id="am_embedding_model_options"></datalist>
+            </label>
+            <label>向量维度
+              <input id="am_embedding_dimensions" class="text_pole" type="number" min="64" max="3072" step="64" />
+            </label>
+            <label>dimensions 参数
+              <select id="am_embedding_dimensions_mode" class="text_pole">
+                <option value="auto">自动判断</option>
+                <option value="never">不发送</option>
+                <option value="always">总是发送</option>
+              </select>
+            </label>
+            <label>最多召回条数（相关度不达标则为0）
+              <input id="am_embedding_top_k" class="text_pole" type="number" min="1" max="12" step="1" />
+            </label>
+          </div>
+          <div class="am-actions">
+            <button id="am_test_embedding">测试向量接口</button>
+            <button id="am_rebuild_vectors">重建向量</button>
+          </div>
+        </div>
+
+        <div class="am-section-title">运行设置</div>
+
+        <label class="checkbox_label">
+          <input id="am_enabled" type="checkbox" />
+          启用锚点记忆
+        </label>
+
+        <div class="am-grid">
+          <label>每多少个有效AI回合生成分段锚点
+            <input id="am_anchor_interval" class="text_pole" type="number" min="5" max="80" step="1" />
+          </label>
+          <label>每生成多少个分段锚点写入一次累计历史
+            <input id="am_merge_anchor_interval" class="text_pole" type="number" min="2" max="20" step="1" />
+          </label>
+          <label>主模型始终保留最近多少个AI回合原文
+            <input id="am_keep_recent" class="text_pole" type="number" min="1" max="30" step="1" />
+          </label>
+          <label>记忆块注入深度（从最新消息向前数；0=最末尾）
+            <input id="am_injection_depth" class="text_pole" type="number" min="0" max="9999" step="1" />
+          </label>
+        </div>
+        <div class="am-note">
+          默认每 15 个有效AI回合生成 1 个分段锚点；累计历史不再按AI回合数判断，而是默认每累计 3 个分段锚点合并一次。这样合并材料始终来自完整分段锚点，不会为了凑回合数在边界混入零散逐楼摘要。
+        </div>
+
+        <div class="am-section-title">主模型记忆预算</div>
+        <div class="am-note">
+          默认按上下文长度动态计算可用记忆 Token，并优先保留累计历史。这里限制的是锚点书自身，不包含角色卡、世界书和最近正文；提高上限后，各记忆区的可用额度会随总预算同步扩展。
+        </div>
+        <label class="checkbox_label">
+          <input id="am_adaptive_token_budget" type="checkbox" />
+          根据本次上下文长度自动收缩记忆块
+        </label>
+        <div class="am-grid">
+          <label>锚点记忆最多 Token
+            <input id="am_memory_max_tokens" class="text_pole" type="number" min="1200" max="32000" step="200" />
+          </label>
+          <label>为主模型回复及其他提示词预留 Token
+            <input id="am_memory_reserve_tokens" class="text_pole" type="number" min="600" max="16000" step="200" />
+          </label>
+        </div>
+
+        <label class="checkbox_label">
+          <input id="am_auto_hide" type="checkbox" />
+          在聊天界面隐藏已被记忆覆盖的旧消息（仅影响显示；发送给模型时仍由“最近原文窗口”独立裁剪）
+        </label>
+
+        <label class="checkbox_label">
+          <input id="am_use_dynamic_recall" type="checkbox" />
+          旧楼动态召回（高楼层推荐）：用当前正文检索过去逐楼摘要；启用向量时采用“语义 + 关键词/实体”混合召回，旧楼没有摘要时使用该楼正文保底。适合 100+ AI回合长聊找回早期细节；会增加少量 Token，不会重复加入最近原文
+        </label>
+
+        <label class="checkbox_label">
+          <input id="am_recall_mentioned_people" type="checkbox" />
+          人物名称或“角色名”单元格中填写的别名在最近对话出现时，注入匹配人物状态（独立于额外旧楼召回）
+        </label>
+
+        <label class="checkbox_label">
+          <input id="am_inject_important_items" type="checkbox" />
+          持续注入重要物品、伏笔与内部梗的当前状态（关闭可减少固定Token）
+        </label>
+
+        <hr />
+      </section>
+
+      <section class="am-tab-panel" data-panel="tools">
+        <div class="am-actions">
+          <button id="am_export_data">导出当前记忆JSON</button>
+          <button id="am_import_data">从下方JSON导入</button>
+          <button id="am_export_config">导出配置JSON</button>
+          <button id="am_import_config">导入配置JSON</button>
+          <button id="am_reset_memory">清空当前聊天锚点记忆</button>
+        </div>
+        <textarea id="am_json_box" class="am-preview text_pole" placeholder="导出/导入JSON会显示在这里"></textarea>
+      </section>
+    </div>
+  </div>
+</div>
