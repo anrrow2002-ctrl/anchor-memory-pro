@@ -143,7 +143,7 @@ function isGenerationActive() {
 
 
 const MODULE = 'anchor_memory';
-const EXTENSION_VERSION = '1.0.2';
+const EXTENSION_VERSION = '1.0.3';
 const DATA_KEY = 'anchorMemory';
 const CORE_PROMPT_KEY = 'anchor_memory_core';
 const RECALL_PROMPT_KEY = 'anchor_memory_recall';
@@ -174,6 +174,7 @@ const CODEX_REBUILD_RETRY_MAX_MS = 10 * 60 * 1000;
 const GODLOG_SOURCE_SETTLE_MS = 1800;
 const GODLOG_POST_GENERATION_SETTLE_MS = 900;
 const ACTIVE_SUMMARY_SOURCE_LOOKUP_GRACE_MS = 8000;
+const SUMMARY_AUTO_RETRY_DELAYS_MS = [2000, 5000];
 const STREAM_TAIL_PROBE_MS = 240;
 const PANEL_RENDER_DEBOUNCE_MS = 120;
 const RELATIONSHIP_MEMORY_CHAR_BUDGET = 3600;
@@ -357,6 +358,9 @@ const state = {
   archiveRunning: false,
   summaryRunning: false,
   activeSummaryRowKey: '',
+  summaryTasks: new Map(),
+  summaryRetryTimers: new Map(),
+  forcedSummaryReruns: new Set(),
   codexRunning: false,
   lastRecall: '',
   lastRecentFacts: '',
@@ -592,7 +596,7 @@ function stopRuntimeForPluginPause(reason = 'plugin-paused') {
   state.codexRunning = false;
   state.jobRunning = false;
   state.pendingIntervalRecheck = false;
-  state.activeSummaryRowKey = '';
+  clearAllSummaryRuntimeTasks();
   state.generationLifecycleActive = false;
   state.generationStartedAt = 0;
   state.generationEndedAt = 0;
@@ -3006,12 +3010,15 @@ function missingGodlogUiStatus(row, data = memoryData()) {
   if (item?.status) return item.status;
   const hasSecondary = secondaryConfigured();
   if (!hasSecondary) return 'missing';
+  if (row && (generationIsActiveForGodlog(row) || !isRowSettledForGodlog(row))) return 'pending';
   return newerAssistantCountForRow(row) >= MISSING_GODLOG_WARNING_MIN_NEWER ? 'missing' : 'pending';
 }
 
 function missingGodlogUiText(row, data = memoryData()) {
+  if (row && generationIsActiveForGodlog(row)) return '正文仍在生成，摘要请求尚未发出；正文结束并稳定后会自动开始。';
+  if (row && !isRowSettledForGodlog(row)) return '正文已结束，正在等待内容稳定；稳定后会自动开始摘要。';
   const status = missingGodlogUiStatus(row, data);
-  if (status === 'pending') return '正文已完成，逐楼摘要正在后台生成或排队。';
+  if (status === 'pending') return '正文已稳定，逐楼摘要正在排队，尚未开始时不会伪装成“生成中”。';
   if (!secondaryConfigured()) return '尚未生成逐楼摘要；配置副API后可自动补写。';
   return '这楼已经落后仍无有效摘要；点“自动补写缺失摘要”会调用模型补写。';
 }
@@ -7116,6 +7123,8 @@ function pruneVectorIndex(data = memoryData()) {
 
 function forgetGodlogItem(data, item, reason = '源楼层已变动', includeUser = false) {
   if (!data || !item) return false;
+  clearSummaryRetryTimer(item.key);
+  state.forcedSummaryReruns.delete(item.key);
   removeGodlogBlockFromMessage(currentRowForGodlog(item, includeUser));
   markAnchorsStaleByKey(data, item.key, reason);
   removeStoredVector(data, item.id);
@@ -7670,9 +7679,98 @@ function currentRowForGodlog(item, includeUser = false) {
   return null;
 }
 
+
+function summaryRowKey(rowOrKey) {
+  if (typeof rowOrKey === 'string') return rowOrKey;
+  return String(rowOrKey?.key || '');
+}
+
+function isSummaryRowBusy(rowOrKey) {
+  const key = summaryRowKey(rowOrKey);
+  return !!key && state.summaryTasks.has(key);
+}
+
+function syncActiveSummaryRowKey() {
+  state.activeSummaryRowKey = state.summaryTasks.keys().next().value || '';
+}
+
+function clearSummaryRetryTimer(rowOrKey) {
+  const key = summaryRowKey(rowOrKey);
+  if (!key) return;
+  const timer = state.summaryRetryTimers.get(key);
+  if (timer) clearTimeout(timer);
+  state.summaryRetryTimers.delete(key);
+}
+
+function clearAllSummaryRuntimeTasks() {
+  for (const timer of state.summaryRetryTimers.values()) clearTimeout(timer);
+  state.summaryRetryTimers.clear();
+  state.forcedSummaryReruns.clear();
+  state.summaryTasks.clear();
+  syncActiveSummaryRowKey();
+}
+
+function summaryErrorIsNonRetryable(error) {
+  if (error?.code === 'AM_REQUEST_CANCELLED') return true;
+  const text = String(error?.message || error || '');
+  return /(?:地址或密钥未配置|逐楼摘要需要先配置并启用副API|副API模型为空|Secondary API (?:400|401|403|404)|invalid\s*(?:api[-_ ]?)?key|unauthori[sz]ed|forbidden|authentication failed|鉴权失败|认证失败)/i.test(text);
+}
+
+function summaryRetryDelay(retryCount) {
+  const index = Math.max(0, Math.min(SUMMARY_AUTO_RETRY_DELAYS_MS.length - 1, Number(retryCount || 1) - 1));
+  return SUMMARY_AUTO_RETRY_DELAYS_MS[index];
+}
+
+function scheduleGodlogAutoRetry(row, force, retryCount, errorText = '') {
+  if (!row?.key || retryCount >= 3 || summaryErrorIsNonRetryable(errorText)) return false;
+  clearSummaryRetryTimer(row.key);
+  const delay = summaryRetryDelay(retryCount);
+  const contextToken = captureChatContextToken(memoryData());
+  const key = row.key;
+  const timer = setTimeout(async () => {
+    state.summaryRetryTimers.delete(key);
+    if (!settings().enabled || !isSameChatContext(contextToken)) return;
+    const current = rowByStableKey(key) || currentRowForGodlog(godlogForRow(memoryData(), row));
+    if (!current) return;
+    if (!isRowSettledForGodlog(current)) {
+      if (force) {
+        state.forcedSummaryReruns.add(key);
+        scheduleMemoryAfterSettle('摘要自动重试等待正文稳定', current, true);
+      } else {
+        scheduleMemoryAfterSettle('摘要自动重试等待正文稳定', current);
+      }
+      return;
+    }
+    if (isSummaryRowBusy(key)) {
+      scheduleGodlogAutoRetry(current, force, Math.max(1, retryCount), errorText);
+      return;
+    }
+    await generateGodlogForRow(current, force);
+  }, delay);
+  state.summaryRetryTimers.set(key, timer);
+  return true;
+}
+
+function markManualRerunQueued(data, row, existing = null) {
+  const item = existing || upsertGodlog(data, row, {
+    status: 'pending',
+    stale: false,
+    error: '正文仍在生成或尚未稳定；已排队手动重跑。',
+  });
+  item.rerunPending = true;
+  item.rerunQueued = true;
+  item.rerunError = '';
+  item.rerunStartedAt = item.rerunStartedAt || Date.now();
+  item.updatedAt = Date.now();
+  state.forcedSummaryReruns.add(row.key);
+  saveMemory();
+  scheduleGodlogPanelRender(row.index);
+  return item;
+}
+
 function activeSummarySourceLookupDeferred(item) {
   if (!item || (item.status !== 'pending' && !item.rerunPending)) return false;
-  const active = state.activeSummaryRowKey && state.activeSummaryRowKey === item.key;
+  const active = isSummaryRowBusy(item.key);
   const deferredAt = Number(item.sourceLookupDeferredAt || item.summaryStartedAt || 0);
   return !!active || (deferredAt > 0 && Date.now() - deferredAt < ACTIVE_SUMMARY_SOURCE_LOOKUP_GRACE_MS);
 }
@@ -7712,6 +7810,26 @@ function syncLatestGodlogPositionFields(data) {
 }
 
 async function generateGodlogForRow(row, force = false) {
+  const key = summaryRowKey(row);
+  if (!key) return false;
+  if (isSummaryRowBusy(key)) return false;
+  if (force && state.forcedSummaryReruns.has(key)) return false;
+
+  clearSummaryRetryTimer(key);
+  const task = generateGodlogForRowUnlocked(row, force);
+  state.summaryTasks.set(key, task);
+  syncActiveSummaryRowKey();
+  scheduleGodlogPanelRender(row.index);
+  try {
+    return await task;
+  } finally {
+    if (state.summaryTasks.get(key) === task) state.summaryTasks.delete(key);
+    syncActiveSummaryRowKey();
+    scheduleGodlogPanelRender(row.index);
+  }
+}
+
+async function generateGodlogForRowUnlocked(row, force = false) {
   if (!settings().enabled || !hasPersistentChatContext()) return false;
   if (!row || row.role !== 'assistant') {
     if (row?.role === 'user') removeGodlogBlockFromMessage(row);
@@ -7742,22 +7860,17 @@ async function generateGodlogForRow(row, force = false) {
   }
 
   if (!isRowSettledForGodlog(row)) {
-    const latest = latestAssistantRow();
-    const isLatest = !!latest && latest.key === row.key;
-    const visibleGenerationActive = isLatest && isGenerationActive();
-    // Manual rerun may break a stale lifecycle latch, but the old completed summary remains active
-    // until a replacement has actually passed validation and is ready to commit.
-    if (force && !visibleGenerationActive) {
-      state.generationLifecycleActive = false;
-      cancelSettleTimer(row);
+    if (force) {
+      markManualRerunQueued(data, row, existing);
+      scheduleMemoryAfterSettle('当前楼正文稳定后执行手动重跑', row, true);
     } else {
       scheduleMemoryAfterSettle('当前楼正文稳定后写摘要', row);
-      return false;
     }
+    return false;
   }
 
+  state.forcedSummaryReruns.delete(row.key);
   const sourceHash = row.rawHash;
-  state.activeSummaryRowKey = row.key;
   const item = replacingCompleted
     ? existing
     : upsertGodlog(data, row, force
@@ -7766,10 +7879,15 @@ async function generateGodlogForRow(row, force = false) {
 
   item.summaryStartedAt = Date.now();
   item.sourceLookupDeferredAt = 0;
-  if (replacingCompleted) {
+  if (force) {
     item.rerunPending = true;
+    item.rerunQueued = false;
+    item.retryScheduledAt = 0;
     item.rerunError = '';
-    item.rerunStartedAt = Date.now();
+    item.rerunStartedAt = item.rerunStartedAt || Date.now();
+  }
+  if (replacingCompleted) {
+    item.rerunRetryCount = item.rerunRetryCount || 0;
   }
   saveMemory();
   showStatus(`正在写逐楼摘要：第 ${row.index + 1} 楼`);
@@ -7869,6 +7987,7 @@ async function generateGodlogForRow(row, force = false) {
       previousRawHash: '',
       error: '',
       retryCount: 0,
+      retryScheduledAt: 0,
       currentRawHash: '',
       sourceMismatch: false,
       sourceMismatchReason: '',
@@ -7878,6 +7997,8 @@ async function generateGodlogForRow(row, force = false) {
       pendingGeneratedBody: '',
       pendingGeneratedRawHash: '',
       rerunPending: false,
+      rerunQueued: false,
+      rerunRetryCount: 0,
       rerunError: '',
       rerunFinishedAt: Date.now(),
       updatedAt: Date.now(),
@@ -7900,31 +8021,49 @@ async function generateGodlogForRow(row, force = false) {
     return true;
   } catch (err) {
     if (!isSameChatContext(contextToken)) return false;
+    const nonRetryable = summaryErrorIsNonRetryable(err);
     if (replacingCompleted) {
-      item.rerunPending = false;
-      item.rerunError = err.message;
-      item.rerunFinishedAt = Date.now();
+      const retryCount = (item.rerunRetryCount || 0) + 1;
+      const willRetry = !nonRetryable && retryCount < 3;
+      item.rerunPending = willRetry;
+      item.rerunQueued = willRetry;
+      item.rerunRetryCount = retryCount;
+      item.rerunError = willRetry
+        ? `第 ${retryCount} 次重跑失败：${err.message}；插件将自动重试（最多3次）。`
+        : err.message;
+      item.rerunFinishedAt = willRetry ? 0 : Date.now();
+      item.retryScheduledAt = willRetry ? Date.now() + summaryRetryDelay(retryCount) : 0;
       data.processing.lastError = `摘要重跑失败，旧摘要已保留：${err.message}`;
       saveMemory();
+      if (willRetry) scheduleGodlogAutoRetry(row, true, retryCount, err);
       return false;
     }
     const retryCount = (item.retryCount || 0) + 1;
+    const willRetry = !nonRetryable && retryCount < 3;
     Object.assign(item, {
-      status: retryCount >= 3 || /副API/.test(err.message) ? 'failed' : 'pending',
+      status: willRetry ? 'pending' : 'failed',
       stale: !!item.body,
       retryCount,
-      error: err.message,
+      retryScheduledAt: willRetry ? Date.now() + summaryRetryDelay(retryCount) : 0,
+      rerunPending: force ? willRetry : !!item.rerunPending,
+      rerunQueued: force ? willRetry : false,
+      rerunRetryCount: force ? retryCount : (item.rerunRetryCount || 0),
+      rerunError: force ? (willRetry ? `第 ${retryCount} 次重跑失败，已安排自动重试。` : err.message) : (item.rerunError || ''),
+      error: willRetry
+        ? `第 ${retryCount} 次摘要请求失败：${err.message}；插件将自动重试（最多3次）。`
+        : err.message,
       updatedAt: Date.now(),
     });
     data.processing.lastError = err.message;
     saveMemory();
-    if (item.status === 'failed') {
+    if (willRetry) {
+      scheduleGodlogAutoRetry(row, force, retryCount, err);
+    } else {
       const raw = rawRecallItem(row);
       if (raw.body) embedMemoryItem(data, raw.id, raw.body).catch(embedErr => console.warn('[AnchorMemory] raw fallback embedding failed', embedErr));
     }
     return false;
   } finally {
-    if (state.contextEpoch === operationEpoch && state.activeSummaryRowKey === row.key) state.activeSummaryRowKey = '';
     if (isSameChatContext(contextToken)) scheduleGodlogPanelRender(row.index);
   }
 }
@@ -8797,10 +8936,11 @@ function rowByStableKey(key) {
   return chatRows(true).find(row => row.role === 'assistant' && row.key === key) || null;
 }
 
-function scheduleMemoryAfterSettle(source = '等待当前楼正文稳定', row = null) {
+function scheduleMemoryAfterSettle(source = '等待当前楼正文稳定', row = null, forceSummaryRerun = false) {
   if (!settings().enabled) return;
   const target = row || latestAssistantRow();
   const targetKey = target?.key || '';
+  const forced = !!forceSummaryRerun || (!!targetKey && state.forcedSummaryReruns.has(targetKey));
   const timerKey = settleTimerKey(target);
   cancelSettleTimer(target);
   const delay = Math.max(250, rowSettleDelay(target) || GODLOG_SOURCE_SETTLE_MS);
@@ -8808,12 +8948,23 @@ function scheduleMemoryAfterSettle(source = '等待当前楼正文稳定', row =
     state.settleTimers.delete(timerKey);
     const current = rowByStableKey(targetKey);
     if (targetKey && !current) {
+      state.forcedSummaryReruns.delete(targetKey);
       queueMemoryJob(`${source}（源楼已删除）`, 0);
       return;
     }
     const observed = current || latestAssistantRow();
     if (observed && !isRowSettledForGodlog(observed)) {
-      scheduleMemoryAfterSettle(source, observed);
+      scheduleMemoryAfterSettle(source, observed, forced);
+      return;
+    }
+    if (forced && observed) {
+      state.forcedSummaryReruns.delete(observed.key);
+      if (isSummaryRowBusy(observed)) {
+        state.forcedSummaryReruns.add(observed.key);
+        scheduleMemoryAfterSettle(`${source}（等待现有摘要任务结束）`, observed, true);
+        return;
+      }
+      generateGodlogForRow(observed, true).catch(err => console.warn('[AnchorMemory] queued manual summary rerun failed', err));
       return;
     }
     queueMemoryJob(source, 0);
@@ -9248,8 +9399,10 @@ function renderTableCards(containerSelector, markdown, emptyText, titleKeys = []
 
 function godlogStatusLabel(status, item = null) {
   if (status === 'archived') return '归档';
+  if (item?.rerunQueued) return '已排队重跑';
+  if (item?.retryScheduledAt && item.retryScheduledAt > Date.now()) return '自动重试中';
   if (status === 'ready') {
-    if (item?.key && state.activeSummaryRowKey === item.key) return '重跑中';
+    if (item?.key && isSummaryRowBusy(item.key)) return '重跑中';
     return item?.sourceMismatch || item?.rerunError ? '已保存' : '已完成';
   }
   if (status === 'missing') return '待自动补写';
@@ -9257,7 +9410,7 @@ function godlogStatusLabel(status, item = null) {
   if (status === 'stale') return '待刷新';
   if (status === 'orphaned') return '孤儿';
   if (status === 'pending') {
-    return item?.key && state.activeSummaryRowKey === item.key ? '生成中' : '排队中';
+    return item?.key && isSummaryRowBusy(item.key) ? '生成中' : '排队中';
   }
   return '待处理';
 }
@@ -9301,7 +9454,7 @@ function renderGodlogList() {
     const status = item.archived ? 'archived' : (item.status === 'failed' ? 'failed' : (item.stale ? 'stale' : (item.status || 'pending')));
     const actions = item.archived
       ? ''
-      : `<div class="am-card-actions"><button class="am-rerun-godlog" data-godlog-id="${escapeHtml(item.id)}">重跑本楼摘要</button></div>`;
+      : `<div class="am-card-actions"><button class="am-rerun-godlog" data-godlog-id="${escapeHtml(item.id)}" ${isSummaryRowBusy(item.key) || item.rerunQueued ? 'disabled' : ''}>${isSummaryRowBusy(item.key) ? '正在重跑…' : (item.rerunQueued ? '已排队重跑' : '重跑本楼摘要')}</button></div>`;
     container.append(`
       <div class="am-card am-godlog-card am-status-${escapeHtml(status)}${synthetic ? ' am-godlog-missing' : ''}" data-godlog-id="${escapeHtml(item.id)}">
         <div class="am-card-title">
@@ -9324,7 +9477,17 @@ function godlogFieldValue(body, tag) {
 }
 
 function messageGodlogSummary(item, row) {
-  if (!item) return missingGodlogUiStatus(row) === 'pending' ? '正在生成逐楼摘要' : '待自动补写逐楼摘要';
+  if (!item) {
+    if (generationIsActiveForGodlog(row)) return '正文生成中 · 摘要尚未开始';
+    if (!isRowSettledForGodlog(row)) return '正文已结束 · 等待稳定后摘要';
+    return missingGodlogUiStatus(row) === 'pending' ? '摘要已排队 · 等待开始' : '待自动补写逐楼摘要';
+  }
+  if (item.rerunQueued) return '已排队手动重跑 · 等待正文稳定';
+  if (item.retryScheduledAt && item.retryScheduledAt > Date.now()) {
+    const attempt = Math.max(item.rerunRetryCount || 0, item.retryCount || 0, 1);
+    return `第 ${attempt} 次失败 · 已安排自动重试`;
+  }
+  if (item.key && isSummaryRowBusy(item.key)) return item.rerunPending ? '正在重跑逐楼摘要' : '正在生成逐楼摘要';
   if (item.status === 'failed') return item.error || '摘要生成失败，等待补写';
   if (item.status === 'stale') return item.error || '楼层内容已更新，等待自动刷新摘要';
   if (item.status === 'pending' && item.body) return item.error || '正在刷新摘要，旧摘要暂时保留';
@@ -9333,7 +9496,7 @@ function messageGodlogSummary(item, row) {
       || godlogFieldValue(item.body, 'Cond').slice(0, 80)
       || `第 ${row.index + 1} 楼摘要已完成`;
   }
-  return item.error || '摘要正在等待生成';
+  return item.error || '摘要已排队，等待开始';
 }
 
 function messageGodlogBody(item, row) {
@@ -9343,7 +9506,11 @@ function messageGodlogBody(item, row) {
     if (item.status === 'stale' || item.stale) {
       notices.push('【旧摘要暂存；当前楼稳定后将自动更新】');
     } else {
-      if (item.rerunPending || (item.key && state.activeSummaryRowKey === item.key)) {
+      if (item.rerunQueued) {
+        notices.push('【手动重跑已排队；正文稳定后会自动开始，旧摘要继续生效。】');
+      } else if (item.retryScheduledAt && item.retryScheduledAt > Date.now()) {
+        notices.push('【本次重跑失败，已安排自动重试；旧摘要继续生效。】');
+      } else if (item.rerunPending || (item.key && isSummaryRowBusy(item.key))) {
         notices.push('【正在手动重跑；旧摘要继续生效，只有新摘要成功后才会替换。】');
       }
       if (item.rerunError) {
@@ -9356,7 +9523,10 @@ function messageGodlogBody(item, row) {
     const prefix = notices.length > 0 ? `${notices.join('\n')}\n` : '';
     return `${prefix}${plainGodlogText(item.body)}`;
   }
-  if (item.status === 'pending') return item.error || '正文已完成，逐楼摘要正在后台生成或排队。';
+  if (item.rerunQueued) return item.error || '正文仍在生成或尚未稳定；手动重跑已排队，稳定后会自动执行。';
+  if (item.retryScheduledAt && item.retryScheduledAt > Date.now()) return item.error || '摘要请求失败，已安排自动重试。';
+  if (item.key && isSummaryRowBusy(item.key)) return item.rerunPending ? '正在手动重跑逐楼摘要；旧摘要在成功前继续生效。' : '逐楼摘要请求已经发出，正在等待模型返回。';
+  if (item.status === 'pending') return item.error || '逐楼摘要已排队，等待后台任务开始。';
   return item.error || '等待生成。';
 }
 
@@ -9570,6 +9740,9 @@ function panelRenderSignature(row, item, status, summary, body) {
     sourceMismatch: !!item?.sourceMismatch,
     currentRawHash: item?.currentRawHash || '',
     rerunPending: !!item?.rerunPending,
+    rerunQueued: !!item?.rerunQueued,
+    retryScheduledAt: item?.retryScheduledAt || 0,
+    busy: !!(row?.key && isSummaryRowBusy(row.key)),
     rerunError: item?.rerunError || '',
     number: item?.number || 0,
     updatedAt: item?.updatedAt || 0,
@@ -9602,7 +9775,12 @@ function renderGodlogPanelForIndex(messageIndex, prepared = null) {
 
   const data = context.data || memoryData();
   const item = godlogForRow(data, row);
-  const status = item?.archived ? 'archived' : (item?.status === 'failed' ? 'failed' : (item?.stale ? 'stale' : (item?.status || 'missing')));
+  if (!item && generationIsActiveForGodlog(row)) {
+    messageEl.querySelector('.am-message-godlog-panel')?.remove();
+    renderInjectionBadgeForIndex(index, context);
+    return true;
+  }
+  const status = item?.archived ? 'archived' : (item?.status === 'failed' ? 'failed' : (item?.stale ? 'stale' : (item?.status || missingGodlogUiStatus(row, data))));
   const id = item?.id || syntheticGodlogId(row);
   const summary = messageGodlogSummary(item, row);
   const body = messageGodlogBody(item, row);
@@ -9632,7 +9810,7 @@ function renderGodlogPanelForIndex(messageIndex, prepared = null) {
         <div class="am-message-godlog-text">${escapeHtml(body)}</div>
         <div class="am-message-godlog-actions">
           <button class="am-message-godlog-open" type="button">打开摘要页</button>
-          <button class="am-message-godlog-rerun" type="button">重跑本楼摘要</button>
+          <button class="am-message-godlog-rerun" type="button" ${isSummaryRowBusy(row) || item?.rerunQueued ? 'disabled' : ''}>${isSummaryRowBusy(row) ? '正在重跑…' : (item?.rerunQueued ? '已排队重跑' : '重跑本楼摘要')}</button>
         </div>
       </div>
     </div>
@@ -9809,12 +9987,18 @@ async function rerunGodlogFromPanel(id) {
     return;
   }
   state.selectedGodlogId = id;
+  if (isSummaryRowBusy(row) || state.forcedSummaryReruns.has(row.key)) {
+    toastr?.info?.(`第 ${row.index + 1} 楼摘要已经在生成或排队中，不会重复提交。`, 'Anchor Memory');
+    scheduleGodlogPanelRender(row.index);
+    return;
+  }
   const ok = await generateGodlogForRow(row, true);
   const current = godlogForRow(memoryData(), row);
   updatePreview();
   renderGodlogPanelForIndex(row.index);
   if (ok) toastr?.success?.(`第 ${row.index + 1} 楼摘要已重新生成`, 'Anchor Memory');
-  else if (isGenerationActive() && isLatestAssistantRow(row)) toastr?.warning?.('当前楼仍在由主模型生成，已排队到生成结束后重跑。', 'Anchor Memory');
+  else if (current?.rerunQueued || state.forcedSummaryReruns.has(row.key)) toastr?.info?.('当前楼正文仍在生成或等待稳定；手动重跑已排队，稳定后会自动执行。', 'Anchor Memory');
+  else if (current?.retryScheduledAt > Date.now()) toastr?.warning?.('本次摘要请求失败，插件已安排自动重试，不需要再次点击。', 'Anchor Memory');
   else toastr?.error?.(`本楼摘要未完成：${current?.rerunError || current?.error || '请检查副API配置或控制台错误'}`, 'Anchor Memory');
 }
 
@@ -10187,12 +10371,17 @@ async function saveSelectedGodlog() {
 async function rerunSelectedGodlog() {
   const syntheticRow = rowFromSyntheticGodlogId(state.selectedGodlogId);
   if (syntheticRow) {
+    if (isSummaryRowBusy(syntheticRow) || state.forcedSummaryReruns.has(syntheticRow.key)) {
+      toastr?.info?.(`第 ${syntheticRow.index + 1} 楼摘要已经在生成或排队中，不会重复提交。`, 'Anchor Memory');
+      return;
+    }
     const ok = await generateGodlogForRow(syntheticRow, true);
     const current = godlogForRow(memoryData(), syntheticRow);
     $('#am_godlog_detail').val(current?.body || current?.error || '');
     updatePreview();
     if (ok) toastr?.success?.(`第 ${syntheticRow.index + 1} 楼摘要已生成`, 'Anchor Memory');
-    else if (isGenerationActive() && isLatestAssistantRow(syntheticRow)) toastr?.warning?.('当前楼仍在由主模型生成，已排队到生成结束后重跑。', 'Anchor Memory');
+    else if (current?.rerunQueued || state.forcedSummaryReruns.has(syntheticRow.key)) toastr?.info?.('当前楼正文仍在生成或等待稳定；手动重跑已排队，稳定后会自动执行。', 'Anchor Memory');
+    else if (current?.retryScheduledAt > Date.now()) toastr?.warning?.('本次摘要请求失败，插件已安排自动重试，不需要再次点击。', 'Anchor Memory');
     else toastr?.error?.(`本楼摘要未完成：${current?.rerunError || current?.error || '请检查副API配置或控制台错误'}`, 'Anchor Memory');
     return;
   }
@@ -10213,12 +10402,17 @@ async function rerunSelectedGodlog() {
     toastr?.warning?.('原楼层已删除，已清理对应摘要', 'Anchor Memory');
     return;
   }
+  if (isSummaryRowBusy(row) || state.forcedSummaryReruns.has(row.key)) {
+    toastr?.info?.(`第 ${row.index + 1} 楼摘要已经在生成或排队中，不会重复提交。`, 'Anchor Memory');
+    return;
+  }
   const ok = await generateGodlogForRow(row, true);
   const current = godlogForRow(memoryData(), row);
   $('#am_godlog_detail').val(current?.body || current?.error || '');
   updatePreview();
   if (ok) toastr?.success?.(`第 ${row.index + 1} 楼摘要已重新生成`, 'Anchor Memory');
-  else if (isGenerationActive() && isLatestAssistantRow(row)) toastr?.warning?.('当前楼仍在由主模型生成，已排队到生成结束后重跑。', 'Anchor Memory');
+  else if (current?.rerunQueued || state.forcedSummaryReruns.has(row.key)) toastr?.info?.('当前楼正文仍在生成或等待稳定；手动重跑已排队，稳定后会自动执行。', 'Anchor Memory');
+  else if (current?.retryScheduledAt > Date.now()) toastr?.warning?.('本次摘要请求失败，插件已安排自动重试，不需要再次点击。', 'Anchor Memory');
   else toastr?.error?.(`本楼摘要未完成：${current?.rerunError || current?.error || '请检查副API配置或控制台错误'}`, 'Anchor Memory');
 }
 
@@ -12144,7 +12338,7 @@ function onChatChanged() {
   state.codexRunning = false;
   state.jobRunning = false;
   state.pendingIntervalRecheck = false;
-  state.activeSummaryRowKey = '';
+  clearAllSummaryRuntimeTasks();
   invalidateMemoryDataCache();
   invalidateRuntimeCaches('chat changed');
   if (state.queueTimer) clearTimeout(state.queueTimer);
