@@ -143,7 +143,7 @@ function isGenerationActive() {
 
 
 const MODULE = 'anchor_memory';
-const EXTENSION_VERSION = '1.0.3';
+const EXTENSION_VERSION = '1.0.5';
 const DATA_KEY = 'anchorMemory';
 const CORE_PROMPT_KEY = 'anchor_memory_core';
 const RECALL_PROMPT_KEY = 'anchor_memory_recall';
@@ -173,6 +173,7 @@ const CODEX_REBUILD_RETRY_MAX_MS = 10 * 60 * 1000;
 // fingerprint has remained unchanged for this long.
 const GODLOG_SOURCE_SETTLE_MS = 1800;
 const GODLOG_POST_GENERATION_SETTLE_MS = 900;
+const GODLOG_FINAL_EVENT_GRACE_MS = 70;
 const ACTIVE_SUMMARY_SOURCE_LOOKUP_GRACE_MS = 8000;
 const SUMMARY_AUTO_RETRY_DELAYS_MS = [2000, 5000];
 const STREAM_TAIL_PROBE_MS = 240;
@@ -390,6 +391,7 @@ const state = {
   generationLifecycleActive: false,
   generationStartedAt: 0,
   rowRevisionState: new Map(),
+  finalizedRowHashes: new Map(),
   chatRowsCache: new Map(),
   chatCacheRef: null,
   chatCacheLength: -1,
@@ -1114,7 +1116,7 @@ function rollbackRelationshipToFloor(data, targetFloor, reason = '剧情楼层�
   table.updatedAt = Date.now();
   data.relationshipTable = table;
   data.codex.relationship = relationshipTableMarkdown(table, false);
-  markRelationshipDirty(data, `${reason}；关系表已回退到第 ${Math.max(0, floor + 1)} 楼之前的最近快照，等待按当前有效剧情复核`);
+  markRelationshipDirty(data, `${reason}；关系表已回退到第 ${Math.max(0, floor)} 楼之前的最近快照，等待按当前有效剧情复核`);
   return changed || true;
 }
 
@@ -2673,7 +2675,7 @@ function turnTextForAssistant(chat, index) {
     const role = message.is_user ? '用户输入' : 'AI回复';
     // Hidden state is deliberately ignored here. Hiding is only a prompt/UI policy and must never
     // change the source fingerprint, otherwise refreshes invalidate perfectly valid summaries.
-    parts.push(`【${role}｜第${i + 1}楼｜${message.name || '未命名'}】
+    parts.push(`【${role}｜第${i}楼｜${message.name || '未命名'}】
 ${text}`);
   }
   return parts.join('\n\n');
@@ -3018,7 +3020,7 @@ function missingGodlogUiText(row, data = memoryData()) {
   if (row && generationIsActiveForGodlog(row)) return '正文仍在生成，摘要请求尚未发出；正文结束并稳定后会自动开始。';
   if (row && !isRowSettledForGodlog(row)) return '正文已结束，正在等待内容稳定；稳定后会自动开始摘要。';
   const status = missingGodlogUiStatus(row, data);
-  if (status === 'pending') return '正文已稳定，逐楼摘要正在排队，尚未开始时不会伪装成“生成中”。';
+  if (status === 'pending') return '正文已稳定，等待后台自动生成逐楼摘要。';
   if (!secondaryConfigured()) return '尚未生成逐楼摘要；配置副API后可自动补写。';
   return '这楼已经落后仍无有效摘要；点“自动补写缺失摘要”会调用模型补写。';
 }
@@ -3080,7 +3082,7 @@ function maybeWarnMissingGodlogs(data = memoryData()) {
   state.lastMissingGodlogWarningSignature = signature;
   state.lastMissingGodlogWarningAt = now;
 
-  const floors = issues.slice(0, 4).map(({ row }) => `第 ${row.index + 1} 楼`).join('、');
+  const floors = issues.slice(0, 4).map(({ row }) => `第 ${row.index} 楼`).join('、');
   const suffix = issues.length > 4 ? `等 ${issues.length} 楼` : '';
   const canRetry = secondaryConfigured();
   const retryText = canRetry
@@ -3090,7 +3092,7 @@ function maybeWarnMissingGodlogs(data = memoryData()) {
   const message = `${floors}${suffix} 没有生成逐楼摘要。${retryText}该楼仍会保持待补写状态；若它离开最近原文窗口，插件会临时注入受限保底原文，并允许后续锚点继续推进，避免一楼失败拖出整段记忆断层。`;
 
   console.warn('[AnchorMemory] missing Godlog rows detected:', issues.map(({ row, item }) => ({
-    floor: row.index + 1,
+    floor: row.index,
     status: item?.status || 'missing',
     error: item?.error || '',
   })));
@@ -4234,7 +4236,7 @@ function buildCodexPatchPrompt(data, row, godlog) {
   const charName = trackedCharacterLabel(data, ctx);
   const trackedNames = trackedCharacterNames(data, ctx);
   const userName = ctx.name1 || '{{user}}';
-  const floor = row.index + 1;
+  const floor = row.index;
   const currentFacts = safeGodlogMemoryText(godlog.body || '');
   const canon = buildCanonContextBlock(data, row, godlog, 7600);
 
@@ -4466,7 +4468,7 @@ async function rebuildCodexFromGodlogs(confirmFirst = true) {
   const operationEpoch = state.contextEpoch;
   const blockedRows = blockedRebuildGodlogRows(data);
   if (blockedRows.length > 0) {
-    const preview = blockedRows.slice(0, 5).map(row => `第${row.index + 1}楼`).join('、');
+    const preview = blockedRows.slice(0, 5).map(row => `第${row.index}楼`).join('、');
     markCodexDirty(data, `等待 ${blockedRows.length} 楼逐楼摘要完成后再安全重建`, false, false, Math.min(...blockedRows.map(row => Number(row.index))));
     markRelationshipDirty(data, `等待 ${blockedRows.length} 楼逐楼摘要完成后再按完整时间线重建`);
     saveMemory(true);
@@ -7890,7 +7892,7 @@ async function generateGodlogForRowUnlocked(row, force = false) {
     item.rerunRetryCount = item.rerunRetryCount || 0;
   }
   saveMemory();
-  showStatus(`正在写逐楼摘要：第 ${row.index + 1} 楼`);
+  showStatus(`正在写逐楼摘要：第 ${row.index} 楼`);
 
   try {
     const basePrompt = buildGodlogPrompt(data, row, item);
@@ -8372,13 +8374,13 @@ function removeOutboundIndices(outbound, removals) {
 
 function hiddenAssistantTurnText(row, godlog) {
   if (isGodlogReady(godlog, row)) {
-    return `【剧情资料｜旧楼摘要｜第 ${row.index + 1} 楼】\n${safePromptMemoryText('godlog', godlog, 1300)}`;
+    return `【剧情资料｜旧楼摘要｜第 ${row.index} 楼】\n${safePromptMemoryText('godlog', godlog, 1300)}`;
   }
-  return `【剧情资料｜旧楼正文已隐藏｜第 ${row.index + 1} 楼】\n这一楼已超过最近原文保留窗口，正文未发送给主模型；逐楼摘要尚未生成。请不要凭空补写这一楼细节。`;
+  return `【剧情资料｜旧楼正文已隐藏｜第 ${row.index} 楼】\n这一楼已超过最近原文保留窗口，正文未发送给主模型；逐楼摘要尚未生成。请不要凭空补写这一楼细节。`;
 }
 
 function hiddenUserTurnText(assistantRow) {
-  return `【剧情资料｜旧用户输入已隐藏】\n该输入已由第 ${assistantRow.index + 1} 楼摘要覆盖，原文未发送给主模型。`;
+  return `【剧情资料｜旧用户输入已隐藏】\n该输入已由第 ${assistantRow.index} 楼摘要覆盖，原文未发送给主模型。`;
 }
 
 function applyGodlogContextReplacement(outboundChat = [], options = {}) {
@@ -8845,11 +8847,24 @@ function noteRowRevision(row, forceTimestamp = false) {
   if (!row?.key) return null;
   const previous = state.rowRevisionState.get(row.key);
   if (forceTimestamp || !previous || previous.hash !== row.rawHash) {
+    // Any content revision invalidates a prior authoritative “finished” mark for this floor.
+    // A later MESSAGE_RECEIVED / GENERATION_ENDED will mark the new hash final again.
+    if (!previous || previous.hash !== row.rawHash) state.finalizedRowHashes.delete(row.key);
     const next = { hash: row.rawHash, changedAt: Date.now() };
     state.rowRevisionState.set(row.key, next);
     return next;
   }
   return previous;
+}
+
+function markRowFinalizedForGodlog(row) {
+  if (!row?.key || !row?.rawHash) return false;
+  state.finalizedRowHashes.set(row.key, row.rawHash);
+  return true;
+}
+
+function rowHasAuthoritativeFinalHash(row) {
+  return !!row?.key && !!row?.rawHash && state.finalizedRowHashes.get(row.key) === row.rawHash;
 }
 
 function observeLatestAssistantRow(forceTimestamp = false) {
@@ -8892,6 +8907,10 @@ function rowSettleDelay(row) {
   if (!row) return 0;
   const latest = observeLatestAssistantRow(false);
   const isLatest = !!latest && latest.key === row.key;
+
+  // GENERATION_ENDED / STOPPED is authoritative even if SillyTavern's lower-level generation flag
+  // takes another event-loop tick to flip. onGenerationStarted clears this mark before a new run.
+  if (rowHasAuthoritativeFinalHash(row)) return 0;
   if (isLatest && generationIsActiveForGodlog(row)) return GODLOG_SOURCE_SETTLE_MS;
 
   const revision = state.rowRevisionState.get(row.key);
@@ -8943,7 +8962,10 @@ function scheduleMemoryAfterSettle(source = '等待当前楼正文稳定', row =
   const forced = !!forceSummaryRerun || (!!targetKey && state.forcedSummaryReruns.has(targetKey));
   const timerKey = settleTimerKey(target);
   cancelSettleTimer(target);
-  const delay = Math.max(250, rowSettleDelay(target) || GODLOG_SOURCE_SETTLE_MS);
+  // IMPORTANT: a settled row legitimately returns 0. Do not use `|| GODLOG_SOURCE_SETTLE_MS` here:
+  // that converted the valid zero into another 1800ms wait and made completed generations feel laggy.
+  const measuredDelay = target ? rowSettleDelay(target) : GODLOG_SOURCE_SETTLE_MS;
+  const delay = Math.max(0, Number(measuredDelay) || 0);
   const timer = setTimeout(() => {
     state.settleTimers.delete(timerKey);
     const current = rowByStableKey(targetKey);
@@ -8968,7 +8990,7 @@ function scheduleMemoryAfterSettle(source = '等待当前楼正文稳定', row =
       return;
     }
     queueMemoryJob(source, 0);
-  }, delay + 60);
+  }, Math.max(GODLOG_FINAL_EVENT_GRACE_MS, delay + 20));
   state.settleTimers.set(timerKey, timer);
 }
 
@@ -9013,9 +9035,12 @@ function onGenerationStarted() {
   if (!settings().enabled) return;
   state.generationLifecycleActive = true;
   state.generationStartedAt = Date.now();
+  // The latest floor may be about to be regenerated/swiped. Its old finalized hash must not grant
+  // the new generation an immediate-summary bypass before the new body is committed.
+  const latest = observeLatestAssistantRow(true);
+  if (latest?.key) state.finalizedRowHashes.delete(latest.key);
   // Do not cancel timers belonging to older edited floors. Their summaries are independent from
   // the newly starting visible generation.
-  observeLatestAssistantRow(true);
 }
 
 function onGenerationFinished(source = '生成结束') {
@@ -9026,6 +9051,9 @@ function onGenerationFinished(source = '生成结束') {
   state.streamProbeTimer = null;
   invalidateRuntimeCaches('generation finished');
   const row = observeLatestAssistantRow(true);
+  // SillyTavern has explicitly told us visible generation is over. Mark this exact body hash final,
+  // then start the summary after only a tiny commit grace instead of the generic 1800ms source debounce.
+  markRowFinalizedForGodlog(row);
   scheduleMemoryAfterSettle(source, row);
   scheduleGodlogPanelRender();
 }
@@ -9410,7 +9438,9 @@ function godlogStatusLabel(status, item = null) {
   if (status === 'stale') return '待刷新';
   if (status === 'orphaned') return '孤儿';
   if (status === 'pending') {
-    return item?.key && isSummaryRowBusy(item.key) ? '生成中' : '排队中';
+    if (item?.key && isSummaryRowBusy(item.key)) return '生成中';
+    if (item?.sourceLookupDeferredAt) return '等待确认';
+    return '待生成';
   }
   return '待处理';
 }
@@ -9458,7 +9488,7 @@ function renderGodlogList() {
     container.append(`
       <div class="am-card am-godlog-card am-status-${escapeHtml(status)}${synthetic ? ' am-godlog-missing' : ''}" data-godlog-id="${escapeHtml(item.id)}">
         <div class="am-card-title">
-          <span>第 ${escapeHtml((item.floor ?? 0) + 1)} 楼 · ${escapeHtml(item.name || '未知')}</span>
+          <span>第 ${escapeHtml(item.floor ?? 0)} 楼 · ${escapeHtml(item.name || '未知')}</span>
           <span class="am-pill">${escapeHtml(godlogStatusLabel(status, item))}</span>
         </div>
         <div class="am-card-meta">Nub ${escapeHtml(item.number || '')} · ${item.updatedAt ? new Date(item.updatedAt).toLocaleString() : '未生成'}</div>
@@ -9480,7 +9510,7 @@ function messageGodlogSummary(item, row) {
   if (!item) {
     if (generationIsActiveForGodlog(row)) return '正文生成中 · 摘要尚未开始';
     if (!isRowSettledForGodlog(row)) return '正文已结束 · 等待稳定后摘要';
-    return missingGodlogUiStatus(row) === 'pending' ? '摘要已排队 · 等待开始' : '待自动补写逐楼摘要';
+    return missingGodlogUiStatus(row) === 'pending' ? '等待自动生成逐楼摘要' : '待自动补写逐楼摘要';
   }
   if (item.rerunQueued) return '已排队手动重跑 · 等待正文稳定';
   if (item.retryScheduledAt && item.retryScheduledAt > Date.now()) {
@@ -9494,9 +9524,9 @@ function messageGodlogSummary(item, row) {
   if (item.status === 'ready') {
     return godlogFieldValue(item.body, 'Title')
       || godlogFieldValue(item.body, 'Cond').slice(0, 80)
-      || `第 ${row.index + 1} 楼摘要已完成`;
+      || `第 ${row.index} 楼摘要已完成`;
   }
-  return item.error || '摘要已排队，等待开始';
+  return item.error || '等待自动生成逐楼摘要';
 }
 
 function messageGodlogBody(item, row) {
@@ -9526,7 +9556,7 @@ function messageGodlogBody(item, row) {
   if (item.rerunQueued) return item.error || '正文仍在生成或尚未稳定；手动重跑已排队，稳定后会自动执行。';
   if (item.retryScheduledAt && item.retryScheduledAt > Date.now()) return item.error || '摘要请求失败，已安排自动重试。';
   if (item.key && isSummaryRowBusy(item.key)) return item.rerunPending ? '正在手动重跑逐楼摘要；旧摘要在成功前继续生效。' : '逐楼摘要请求已经发出，正在等待模型返回。';
-  if (item.status === 'pending') return item.error || '逐楼摘要已排队，等待后台任务开始。';
+  if (item.status === 'pending') return item.error || '等待后台自动生成逐楼摘要。';
   return item.error || '等待生成。';
 }
 
@@ -9576,7 +9606,7 @@ function memoryRefLabel(ref, data = memoryData()) {
   const aiTurnNumber = Number(ref?.number || source?.assistantNumber || source?.number || 0);
   const number = ['godlog', 'raw-recall'].includes(ref?.kind)
     ? (aiTurnNumber > 0 ? `第 ${aiTurnNumber} 个AI回合`
-      : (Number.isInteger(ref?.floor) ? `聊天第 ${ref.floor + 1} 楼` : ''))
+      : (Number.isInteger(ref?.floor) ? `聊天第 ${ref.floor} 楼` : ''))
     : (source?.number || ref?.number ? `第 ${source?.number || ref.number} 次` : '');
   return [kind, number, title].filter(Boolean).join(' · ');
 }
@@ -9611,7 +9641,7 @@ function formatMessageRecallDetail(record, data = memoryData()) {
   const lines = [
     '【历史记录提示】这是该楼当时生成前实际收到的记忆快照，不会因后来新建锚点而回溯改写，也不代表下一次生成仍会注入同样内容。',
     '',
-    `第 ${Number(record.floor ?? 0) + 1} 楼生成前注入记录`,
+    `第 ${Number(record.floor ?? 0)} 楼生成前注入记录`,
     `注入字符：${record.injectedChars || 0}`,
     `记录时间：${record.at ? new Date(record.at).toLocaleString() : '未记录'}`,
     '',
@@ -9775,6 +9805,15 @@ function renderGodlogPanelForIndex(messageIndex, prepared = null) {
 
   const data = context.data || memoryData();
   const item = godlogForRow(data, row);
+  const hasExplicitQueuedRerun = state.forcedSummaryReruns.has(row.key);
+  // Do not render a fake "queued" summary card for the normal settle/backlog window.
+  // The card appears only once a real summary record/request exists, or when the user explicitly
+  // queued a manual rerun. This keeps every new floor from looking permanently stuck in a queue.
+  if (!item && !hasExplicitQueuedRerun) {
+    messageEl.querySelector('.am-message-godlog-panel')?.remove();
+    renderInjectionBadgeForIndex(index, context);
+    return true;
+  }
   if (!item && generationIsActiveForGodlog(row)) {
     messageEl.querySelector('.am-message-godlog-panel')?.remove();
     renderInjectionBadgeForIndex(index, context);
@@ -9801,7 +9840,7 @@ function renderGodlogPanelForIndex(messageIndex, prepared = null) {
     <div class="am-message-godlog-panel am-status-${escapeHtml(status)}${wasOpen ? ' open' : ''}" data-godlog-id="${escapeHtml(id)}" data-message-index="${escapeHtml(index)}" data-render-signature="${escapeHtml(signature)}">
       <button class="am-message-godlog-toggle" type="button" title="展开逐楼摘要">
         <span class="am-message-godlog-mark">a</span>
-        <span class="am-message-godlog-floor">第 ${escapeHtml(index + 1)} 楼</span>
+        <span class="am-message-godlog-floor">第 ${escapeHtml(index)} 楼</span>
         <span class="am-message-godlog-status">${escapeHtml(godlogStatusLabel(status, item))}</span>
         <span class="am-message-godlog-summary">${escapeHtml(summary)}</span>
       </button>
@@ -9988,7 +10027,7 @@ async function rerunGodlogFromPanel(id) {
   }
   state.selectedGodlogId = id;
   if (isSummaryRowBusy(row) || state.forcedSummaryReruns.has(row.key)) {
-    toastr?.info?.(`第 ${row.index + 1} 楼摘要已经在生成或排队中，不会重复提交。`, 'Anchor Memory');
+    toastr?.info?.(`第 ${row.index} 楼摘要任务已接收，不会重复提交。`, 'Anchor Memory');
     scheduleGodlogPanelRender(row.index);
     return;
   }
@@ -9996,7 +10035,7 @@ async function rerunGodlogFromPanel(id) {
   const current = godlogForRow(memoryData(), row);
   updatePreview();
   renderGodlogPanelForIndex(row.index);
-  if (ok) toastr?.success?.(`第 ${row.index + 1} 楼摘要已重新生成`, 'Anchor Memory');
+  if (ok) toastr?.success?.(`第 ${row.index} 楼摘要已重新生成`, 'Anchor Memory');
   else if (current?.rerunQueued || state.forcedSummaryReruns.has(row.key)) toastr?.info?.('当前楼正文仍在生成或等待稳定；手动重跑已排队，稳定后会自动执行。', 'Anchor Memory');
   else if (current?.retryScheduledAt > Date.now()) toastr?.warning?.('本次摘要请求失败，插件已安排自动重试，不需要再次点击。', 'Anchor Memory');
   else toastr?.error?.(`本楼摘要未完成：${current?.rerunError || current?.error || '请检查副API配置或控制台错误'}`, 'Anchor Memory');
@@ -10163,7 +10202,7 @@ function renderHealth() {
   const staleGodlogs = (data.godlogs || []).filter(item => item.status === 'stale');
   const staleAnchors = (data.anchors || []).filter(item => item.stale);
   const missingDiagnostics = missingGodlogDiagnostics(data);
-  const missingFloors = missingDiagnostics.slice(0, 5).map(({ row }) => `第${row.index + 1}楼`).join('、');
+  const missingFloors = missingDiagnostics.slice(0, 5).map(({ row }) => `第${row.index}楼`).join('、');
   if (failedGodlogs.length > 0) issues.push(`有 ${failedGodlogs.length} 条逐楼摘要待自动补写，可到“逐楼摘要”页点“自动补写缺失摘要”或重跑单楼。`);
   if (staleGodlogs.length > 0) issues.push(`有 ${staleGodlogs.length} 条逐楼摘要已过期，通常来自编辑、swipe 或 regenerate。`);
   if (staleAnchors.length > 0) issues.push(`检测到 ${staleAnchors.length} 个旧版过期锚点；重新载入聊天后会自动清理。`);
@@ -10278,7 +10317,7 @@ function renderRecallHits() {
     const label = memoryRefKindLabel(hit, data);
     const body = memoryRefBody(hit, data);
     const position = ['godlog', 'raw-recall'].includes(hit.kind)
-      ? (Number(hit.number) > 0 ? `第 ${Number(hit.number)} 个AI回合` : (Number.isInteger(hit.floor) ? `聊天第 ${hit.floor + 1} 楼` : '旧AI回合'))
+      ? (Number(hit.number) > 0 ? `第 ${Number(hit.number)} 个AI回合` : (Number.isInteger(hit.floor) ? `聊天第 ${hit.floor} 楼` : '旧AI回合'))
       : `第 ${hit.number} 次`;
     container.append(`
       <div class="am-card">
@@ -10372,14 +10411,14 @@ async function rerunSelectedGodlog() {
   const syntheticRow = rowFromSyntheticGodlogId(state.selectedGodlogId);
   if (syntheticRow) {
     if (isSummaryRowBusy(syntheticRow) || state.forcedSummaryReruns.has(syntheticRow.key)) {
-      toastr?.info?.(`第 ${syntheticRow.index + 1} 楼摘要已经在生成或排队中，不会重复提交。`, 'Anchor Memory');
+      toastr?.info?.(`第 ${syntheticRow.index} 楼摘要任务已接收，不会重复提交。`, 'Anchor Memory');
       return;
     }
     const ok = await generateGodlogForRow(syntheticRow, true);
     const current = godlogForRow(memoryData(), syntheticRow);
     $('#am_godlog_detail').val(current?.body || current?.error || '');
     updatePreview();
-    if (ok) toastr?.success?.(`第 ${syntheticRow.index + 1} 楼摘要已生成`, 'Anchor Memory');
+    if (ok) toastr?.success?.(`第 ${syntheticRow.index} 楼摘要已生成`, 'Anchor Memory');
     else if (current?.rerunQueued || state.forcedSummaryReruns.has(syntheticRow.key)) toastr?.info?.('当前楼正文仍在生成或等待稳定；手动重跑已排队，稳定后会自动执行。', 'Anchor Memory');
     else if (current?.retryScheduledAt > Date.now()) toastr?.warning?.('本次摘要请求失败，插件已安排自动重试，不需要再次点击。', 'Anchor Memory');
     else toastr?.error?.(`本楼摘要未完成：${current?.rerunError || current?.error || '请检查副API配置或控制台错误'}`, 'Anchor Memory');
@@ -10403,14 +10442,14 @@ async function rerunSelectedGodlog() {
     return;
   }
   if (isSummaryRowBusy(row) || state.forcedSummaryReruns.has(row.key)) {
-    toastr?.info?.(`第 ${row.index + 1} 楼摘要已经在生成或排队中，不会重复提交。`, 'Anchor Memory');
+    toastr?.info?.(`第 ${row.index} 楼摘要任务已接收，不会重复提交。`, 'Anchor Memory');
     return;
   }
   const ok = await generateGodlogForRow(row, true);
   const current = godlogForRow(memoryData(), row);
   $('#am_godlog_detail').val(current?.body || current?.error || '');
   updatePreview();
-  if (ok) toastr?.success?.(`第 ${row.index + 1} 楼摘要已重新生成`, 'Anchor Memory');
+  if (ok) toastr?.success?.(`第 ${row.index} 楼摘要已重新生成`, 'Anchor Memory');
   else if (current?.rerunQueued || state.forcedSummaryReruns.has(row.key)) toastr?.info?.('当前楼正文仍在生成或等待稳定；手动重跑已排队，稳定后会自动执行。', 'Anchor Memory');
   else if (current?.retryScheduledAt > Date.now()) toastr?.warning?.('本次摘要请求失败，插件已安排自动重试，不需要再次点击。', 'Anchor Memory');
   else toastr?.error?.(`本楼摘要未完成：${current?.rerunError || current?.error || '请检查副API配置或控制台错误'}`, 'Anchor Memory');
@@ -10702,7 +10741,7 @@ async function finalizeArchiveForTransfer(archiveName = '') {
     const fresh = memoryData();
     const remaining = missingGodlogRepairRows(fresh);
     if (remaining.length > 0) {
-      const floors = remaining.slice(0, 6).map(row => `第${row.index + 1}楼`).join('、');
+      const floors = remaining.slice(0, 6).map(row => `第${row.index}楼`).join('、');
       throw new Error(`${floors}${remaining.length > 6 ? `等${remaining.length}楼` : ''}仍没有有效逐楼摘要；档案未被覆盖`);
     }
 
@@ -12100,7 +12139,7 @@ function bindUi() {
     state.selectedGodlogId = id;
     const item = (memoryData().godlogs || []).find(entry => entry.id === id);
     const syntheticRow = rowFromSyntheticGodlogId(id);
-    $('#am_godlog_detail').val(item?.body || item?.error || (syntheticRow ? `第 ${syntheticRow.index + 1} 楼尚未生成逐楼摘要。请点“重跑本楼摘要”或“自动补写缺失摘要”，插件会调用模型自动补写。` : ''));
+    $('#am_godlog_detail').val(item?.body || item?.error || (syntheticRow ? `第 ${syntheticRow.index} 楼尚未生成逐楼摘要。请点“重跑本楼摘要”或“自动补写缺失摘要”，插件会调用模型自动补写。` : ''));
   });
   $('#am_godlog_list').on('click', '.am-rerun-godlog', async function (event) {
     event.stopPropagation();
@@ -12304,8 +12343,11 @@ function onMessageReceived() {
   if (state.streamProbeTimer) clearTimeout(state.streamProbeTimer);
   state.streamProbeTimer = null;
   invalidateRuntimeCaches('message received');
-  observeLatestAssistantRow(true);
-  scheduleMemoryAfterSettle('AI消息完整写入后处理');
+  const row = observeLatestAssistantRow(true);
+  // Some SillyTavern/back-end paths commit MESSAGE_RECEIVED just after GENERATION_ENDED. If visible
+  // generation is already inactive, this is the strongest final-body signal and should kick summary now.
+  if (row && !generationIsActiveForGodlog(row)) markRowFinalizedForGodlog(row);
+  scheduleMemoryAfterSettle('AI消息完整写入后处理', row);
 }
 
 function onLatestMessageRendered(payload) {
@@ -12368,6 +12410,7 @@ function onChatChanged() {
   state.generationStartedAt = 0;
   state.generationEndedAt = 0;
   state.rowRevisionState.clear();
+  state.finalizedRowHashes.clear();
   state.jobSources.clear();
   state.selectedRecallMessageKey = '';
   state.lastInjectionRefs = [];
