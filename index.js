@@ -28,6 +28,11 @@ import {
   summaryRevisionHash,
   lockCompletedSummaryToSavedSnapshot,
 } from './core/summary-lifecycle.js';
+import {
+  normalizeOpenAiCompatibleBaseUrl,
+  openAiCompatibleProviderInfo,
+  providerCompatibilityHint,
+} from './core/provider-compat.js';
 
 /**
  * SillyTavern compatibility layer.
@@ -3758,13 +3763,31 @@ function validateCodexPatchStructure(data, markdown) {
 }
 
 function baseApiUrl(url) {
-  return String(url || '')
-    .trim()
-    .replace(/\/+$/, '')
-    .replace(/\/chat\/completions\/?$/i, '')
-    .replace(/\/responses\/?$/i, '')
-    .replace(/\/embeddings\/?$/i, '')
-    .replace(/\/models\/?$/i, '');
+  return normalizeOpenAiCompatibleBaseUrl(url);
+}
+
+function updateSecondaryProviderHint(value = settings().secondaryUrl) {
+  const node = $('#am_secondary_provider_hint');
+  if (!node.length) return;
+  node.text(providerCompatibilityHint(value));
+}
+
+function secondaryConnectionDiagnostics(base, model, message = '') {
+  const info = openAiCompatibleProviderInfo(base);
+  const raw = String(message || '').trim();
+  const lower = raw.toLowerCase();
+  let hint = '';
+  if (/401|unauthori|invalid.*key|api.?key|鉴权|密钥/.test(lower)) {
+    hint = '请检查该平台的 API Key 是否属于当前地域/业务空间，并确认没有复制到多余空格。';
+  } else if (/404|not.?found|model.?not.?found|不存在/.test(lower)) {
+    hint = '请检查模型 ID 与 Base URL 是否属于同一平台/地域；模型名必须使用控制台或模型列表中的精确 ID。';
+  } else if (/400|bad request|invalid.?request|参数|parameter/.test(lower)) {
+    hint = '这是上游常见的参数/模型错误；插件已使用最小 OpenAI Chat Completions 参数集，请优先核对模型 ID、地域和额度。';
+  } else if (/429|rate.?limit|quota|限流|额度/.test(lower)) {
+    hint = '可能触发限流或额度不足，请稍后重试并检查平台余额/并发限制。';
+  }
+  const details = `${info.name}；Base URL=${info.baseUrl || base || '未识别'}；model=${String(model || '').trim() || '未填写'}`;
+  return `${raw}${raw ? '；' : ''}${details}${hint ? `。${hint}` : ''}`;
 }
 
 function secondaryConfigured(value = settings()) {
@@ -4088,7 +4111,9 @@ async function callSecondary(messages, maxTokens = 2400, options = {}) {
           proxy_password: s.secondaryKey,
           model: s.secondaryModel || undefined,
           messages: requestMessages,
-          temperature: 0.25,
+          // Keep the compatibility request intentionally minimal. Several domestic OpenAI-compatible
+          // providers/models impose model-specific temperature constraints (notably Kimi K2.5/K2.6),
+          // so omitting it lets the upstream model choose its documented default.
           max_tokens: tokenBudget,
           stream: false,
         }),
@@ -4109,7 +4134,7 @@ async function callSecondary(messages, maxTokens = 2400, options = {}) {
 
     if (!response.ok) {
       const errText = await response.text().catch(() => '');
-      throw new Error(`Secondary API ${response.status}: ${errText.slice(0, 180)}`);
+      throw new Error(secondaryConnectionDiagnostics(base, s.secondaryModel, `Secondary API ${response.status}: ${errText.slice(0, 180)}`));
     }
     const raw = await response.text();
     if (!String(raw || '').trim()) throw new Error('副API返回了空响应体；请先点“测试副API”检查模型、地址和密钥');
@@ -4127,7 +4152,7 @@ async function callSecondary(messages, maxTokens = 2400, options = {}) {
       return { content: plain, finishReason: '' };
     }
     const apiError = extractSecondaryError(parsed);
-    if (apiError) throw new Error(`副API返回错误：${apiError}`);
+    if (apiError) throw new Error(`副API返回错误：${secondaryConnectionDiagnostics(base, s.secondaryModel, apiError)}`);
     const content = extractSecondaryResponseText(parsed);
     const finishReason = extractSecondaryFinishReason(parsed);
     if (!content) {
@@ -10038,7 +10063,7 @@ async function rerunGodlogFromPanel(id) {
   if (ok) toastr?.success?.(`第 ${row.index} 楼摘要已重新生成`, 'Anchor Memory');
   else if (current?.rerunQueued || state.forcedSummaryReruns.has(row.key)) toastr?.info?.('当前楼正文仍在生成或等待稳定；手动重跑已排队，稳定后会自动执行。', 'Anchor Memory');
   else if (current?.retryScheduledAt > Date.now()) toastr?.warning?.('本次摘要请求失败，插件已安排自动重试，不需要再次点击。', 'Anchor Memory');
-  else toastr?.error?.(`本楼摘要未完成：${current?.rerunError || current?.error || '请检查副API配置或控制台错误'}`, 'Anchor Memory');
+  else toastr?.error?.(`本楼摘要未完成：${current?.rerunError || current?.error || memoryData()?.processing?.lastError || '请检查副API配置或控制台错误'}`, 'Anchor Memory');
 }
 
 function renderMemoryCards(container, items, emptyText) {
@@ -10421,7 +10446,7 @@ async function rerunSelectedGodlog() {
     if (ok) toastr?.success?.(`第 ${syntheticRow.index} 楼摘要已生成`, 'Anchor Memory');
     else if (current?.rerunQueued || state.forcedSummaryReruns.has(syntheticRow.key)) toastr?.info?.('当前楼正文仍在生成或等待稳定；手动重跑已排队，稳定后会自动执行。', 'Anchor Memory');
     else if (current?.retryScheduledAt > Date.now()) toastr?.warning?.('本次摘要请求失败，插件已安排自动重试，不需要再次点击。', 'Anchor Memory');
-    else toastr?.error?.(`本楼摘要未完成：${current?.rerunError || current?.error || '请检查副API配置或控制台错误'}`, 'Anchor Memory');
+    else toastr?.error?.(`本楼摘要未完成：${current?.rerunError || current?.error || memoryData()?.processing?.lastError || '请检查副API配置或控制台错误'}`, 'Anchor Memory');
     return;
   }
   const found = findGodlogItem(state.selectedGodlogId);
@@ -10452,7 +10477,7 @@ async function rerunSelectedGodlog() {
   if (ok) toastr?.success?.(`第 ${row.index} 楼摘要已重新生成`, 'Anchor Memory');
   else if (current?.rerunQueued || state.forcedSummaryReruns.has(row.key)) toastr?.info?.('当前楼正文仍在生成或等待稳定；手动重跑已排队，稳定后会自动执行。', 'Anchor Memory');
   else if (current?.retryScheduledAt > Date.now()) toastr?.warning?.('本次摘要请求失败，插件已安排自动重试，不需要再次点击。', 'Anchor Memory');
-  else toastr?.error?.(`本楼摘要未完成：${current?.rerunError || current?.error || '请检查副API配置或控制台错误'}`, 'Anchor Memory');
+  else toastr?.error?.(`本楼摘要未完成：${current?.rerunError || current?.error || memoryData()?.processing?.lastError || '请检查副API配置或控制台错误'}`, 'Anchor Memory');
 }
 
 function deleteSelectedGodlog() {
@@ -11031,6 +11056,7 @@ function loadSecondaryPreset(presetId) {
 
   $('#am_secondary_url').val(s.secondaryUrl);
   $('#am_secondary_key').val(s.secondaryKey);
+  updateSecondaryProviderHint(s.secondaryUrl);
   $('#am_secondary_model').val(s.secondaryModel);
   renderModelOptions('#am_secondary_model_options', s.secondaryModels);
   $('#am_secondary_preset_name').val(preset.name);
@@ -11109,7 +11135,12 @@ function syncSecondaryInputsFromUi({ clearModel = false } = {}) {
   const urlInput = $('#am_secondary_url');
   const keyInput = $('#am_secondary_key');
   const modelInput = $('#am_secondary_model');
-  if (urlInput.length) s.secondaryUrl = String(urlInput.val() || '').trim();
+  if (urlInput.length) {
+    const typedUrl = String(urlInput.val() || '').trim();
+    s.secondaryUrl = baseApiUrl(typedUrl);
+    if (typedUrl && s.secondaryUrl && typedUrl !== s.secondaryUrl) urlInput.val(s.secondaryUrl);
+    updateSecondaryProviderHint(s.secondaryUrl);
+  }
   if (keyInput.length) s.secondaryKey = String(keyInput.val() || '').trim();
   if (clearModel) {
     s.secondaryModel = '';
@@ -11166,9 +11197,10 @@ function selectFetchedModel(current, models) {
 
 async function fetchSecondaryModels() {
   // Read the DOM synchronously before the mobile keyboard/blur lifecycle can leave settings stale.
-  // Every pull starts from a clean model field. A revision guard prevents a late result from an old
-  // URL/key from overwriting a preset or manual edit selected while the request was in flight.
-  const s = syncSecondaryInputsFromUi({ clearModel: true });
+  // Do NOT clear a manually-entered model merely because /models is unsupported: some otherwise
+  // valid OpenAI-compatible providers (or account tiers) require users to copy the model ID from
+  // their console. A revision guard still prevents stale results overwriting a changed connection.
+  const s = syncSecondaryInputsFromUi({ clearModel: false });
   const requestRevision = Number(state.secondaryConfigRevision) || 0;
   if (!s.secondaryUrl || !s.secondaryKey) {
     toastr?.warning?.('请先填写副API地址和密钥', 'Anchor Memory');
@@ -11183,7 +11215,7 @@ async function fetchSecondaryModels() {
       return;
     }
     s.secondaryModels = models;
-    s.secondaryModel = selectFetchedModel('', models);
+    s.secondaryModel = selectFetchedModel(s.secondaryModel, models);
     bumpSecondaryConfigRevision();
     saveSettingsDebounced();
     renderModelOptions('#am_secondary_model_options', models);
@@ -11196,13 +11228,8 @@ async function fetchSecondaryModels() {
       console.info('[AnchorMemory] secondary model pull cancelled or superseded; current configuration preserved');
       return;
     }
-    s.secondaryModels = [];
-    s.secondaryModel = '';
-    bumpSecondaryConfigRevision();
-    saveSettingsDebounced();
-    $('#am_secondary_model').val('');
-    renderModelOptions('#am_secondary_model_options', []);
-    toastr?.error?.(`模型拉取失败：${err.message}。模型栏已清空，可修正地址/密钥后重试，或手动粘贴准确模型名。`, 'Anchor Memory');
+    const info = openAiCompatibleProviderInfo(s.secondaryUrl);
+    toastr?.error?.(`模型拉取失败：${err.message}。${info.name} 若未开放标准 /models 列表，可直接保留并手动填写控制台中的准确模型 ID；现有模型不会被清空。`, 'Anchor Memory');
   } finally {
     setButtonBusy('#am_fetch_secondary_models', false);
     updateSecondaryPresetStatus();
@@ -11285,7 +11312,8 @@ async function testSecondary() {
       { role: 'system', content: '你是连接测试助手。' },
       { role: 'user', content: '请只回复：连接成功' },
     ], 50);
-    toastr?.success?.(`副API可用：${text.slice(0, 80)}`, 'Anchor Memory');
+    const info = openAiCompatibleProviderInfo(s.secondaryUrl);
+    toastr?.success?.(`${info.name} 可用：${text.slice(0, 80)}`, 'Anchor Memory');
   } catch (err) {
     toastr?.error?.(`副API测试失败：${err.message}`, 'Anchor Memory');
   } finally {
@@ -11972,6 +12000,7 @@ function loadUi() {
   $('#am_use_secondary').prop('checked', !!s.useSecondary);
   $('#am_secondary_url').val(s.secondaryUrl);
   $('#am_secondary_key').val(s.secondaryKey);
+  updateSecondaryProviderHint(s.secondaryUrl);
   $('#am_secondary_model').val(s.secondaryModel);
   renderModelOptions('#am_secondary_model_options', s.secondaryModels || []);
   renderSecondaryPresetOptions();
@@ -12064,6 +12093,7 @@ function bindUi() {
     const s = settings();
     const key = this.id === 'am_secondary_url' ? 'secondaryUrl' : 'secondaryKey';
     const value = String(this.value || '').trim();
+    if (this.id === 'am_secondary_url') updateSecondaryProviderHint(value);
     if (s[key] !== value) {
       s[key] = value;
       // A model selected for another endpoint/key is unsafe. Clear it immediately instead of

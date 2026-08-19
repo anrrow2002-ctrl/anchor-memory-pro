@@ -308,8 +308,11 @@
             </div>
           </div>
           <label>副API地址
-            <input id="am_secondary_url" class="text_pole" type="text" placeholder="https://api.example.com/v1 或 https://api.example.com/v1/chat/completions" />
+            <input id="am_secondary_url" class="text_pole" type="text" placeholder="例如 https://ark.cn-beijing.volces.com/api/v3 或 https://api.siliconflow.cn/v1" />
           </label>
+          <div id="am_secondary_provider_hint" class="am-note">
+            支持自动识别火山方舟/豆包、硅基流动、DeepSeek、百炼/千问、Kimi、智谱GLM、百度千帆、腾讯混元、MiniMax、阶跃星辰、百川、Gitee AI、魔搭；也支持其他 OpenAI 兼容接口。
+          </div>
           <label>副API密钥
             <input id="am_secondary_key" class="text_pole" type="password" placeholder="sk-..." />
           </label>
@@ -322,7 +325,7 @@
             <button id="am_test_secondary" type="button">测试副API</button>
           </div>
           <div class="am-note">
-            每次点击“拉取副API模型”都会先清空旧模型栏，再读取当前手机输入框中的地址与密钥；插件优先通过酒馆后端代理拉取，失败后才尝试浏览器直连。拉取失败时模型栏保持为空，不会继续误用旧模型。
+            地址可填平台 Base URL，也可直接粘贴完整的 /chat/completions；插件会自动归一化。只填官网域名时，已识别平台会自动补齐 /api/v3、/v1、/v2、/compatible-mode/v1 等正确路径。每次点击“拉取副API模型”都会读取当前地址与密钥；插件优先通过酒馆后端代理拉取，失败后才尝试浏览器直连。若平台没有开放标准 /models 列表，拉取失败也不会再清空你手动填写的模型 ID。
           </div>
         </div>
 
