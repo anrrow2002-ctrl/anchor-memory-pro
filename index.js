@@ -11132,9 +11132,13 @@ function deleteSecondaryPreset() {
 function syncSecondaryInputsFromUi({ clearModel = false } = {}) {
   const s = settings();
   const before = JSON.stringify(secondaryPresetSnapshot(s));
+  const enabledInput = $('#am_use_secondary');
   const urlInput = $('#am_secondary_url');
   const keyInput = $('#am_secondary_key');
   const modelInput = $('#am_secondary_model');
+  // Keep the visible toggle and the persisted runtime state in lockstep. On some mobile/WebView
+  // builds a checkbox can visually change before its standalone `change` handler has flushed.
+  if (enabledInput.length) s.useSecondary = !!enabledInput.prop('checked');
   if (urlInput.length) {
     const typedUrl = String(urlInput.val() || '').trim();
     s.secondaryUrl = baseApiUrl(typedUrl);
@@ -11216,13 +11220,18 @@ async function fetchSecondaryModels() {
     }
     s.secondaryModels = models;
     s.secondaryModel = selectFetchedModel(s.secondaryModel, models);
+    // A successful authenticated /models request proves that the user is actively configuring this
+    // connection. Enable background memory here so the next step cannot contradict the success toast
+    // with a stale "please enable the secondary API" warning.
+    s.useSecondary = true;
     bumpSecondaryConfigRevision();
     saveSettingsDebounced();
     renderModelOptions('#am_secondary_model_options', models);
     $('#am_secondary_model').val(s.secondaryModel);
+    $('#am_use_secondary').prop('checked', true);
     updateSecondaryPresetStatus();
-    if (secondaryConfigured(s)) queueMemoryJob('副API模型已配置，继续补齐记忆', 180);
-    toastr?.success?.(`已拉取 ${models.length} 个副API模型，并自动选择 ${s.secondaryModel}`, 'Anchor Memory');
+    if (secondaryConfigured(s)) queueMemoryJob('副API模型已配置并启用，继续补齐记忆', 120);
+    toastr?.success?.(`已拉取 ${models.length} 个副API模型，自动选择 ${s.secondaryModel}，并已启用副API`, 'Anchor Memory');
   } catch (err) {
     if (requestRevision !== Number(state.secondaryConfigRevision || 0) || err?.code === 'AM_REQUEST_CANCELLED') {
       console.info('[AnchorMemory] secondary model pull cancelled or superseded; current configuration preserved');
@@ -11302,8 +11311,14 @@ async function testEmbedding() {
 
 async function testSecondary() {
   const s = syncSecondaryInputsFromUi();
-  if (!secondaryConfigured(s)) {
-    toastr?.warning?.('请先启用副API并填写地址、密钥和模型', 'Anchor Memory');
+  // Testing a connection must not depend on whether background memory writing is enabled. The
+  // toggle controls automatic use; it should never block a manual connectivity test.
+  const missing = [];
+  if (!baseApiUrl(s.secondaryUrl)) missing.push('地址');
+  if (!String(s.secondaryKey || '').trim()) missing.push('密钥');
+  if (!String(s.secondaryModel || '').trim()) missing.push('模型');
+  if (missing.length) {
+    toastr?.warning?.(`请先填写副API${missing.join('、')}`, 'Anchor Memory');
     return;
   }
   try {
@@ -11313,7 +11328,8 @@ async function testSecondary() {
       { role: 'user', content: '请只回复：连接成功' },
     ], 50);
     const info = openAiCompatibleProviderInfo(s.secondaryUrl);
-    toastr?.success?.(`${info.name} 可用：${text.slice(0, 80)}`, 'Anchor Memory');
+    const suffix = s.useSecondary ? '；后台记忆已启用' : '；连接正常，但后台记忆当前未启用';
+    toastr?.success?.(`${info.name} 可用：${text.slice(0, 80)}${suffix}`, 'Anchor Memory');
   } catch (err) {
     toastr?.error?.(`副API测试失败：${err.message}`, 'Anchor Memory');
   } finally {
@@ -12082,8 +12098,14 @@ function bindUi() {
   $('#am_recall_mentioned_people').on('change', function () { saveSetting('recallMentionedPeople', this.checked); injectMemory().catch(console.warn); });
   $('#am_inject_important_items').on('change', function () { saveSetting('injectImportantItems', this.checked); injectMemory().catch(console.warn); });
   $('#am_use_secondary').on('change', function () {
-    saveSetting('useSecondary', this.checked);
-    if (this.checked && secondaryConfigured()) queueMemoryJob('副API已启用，继续补齐记忆', 120);
+    const s = settings();
+    const next = !!this.checked;
+    if (s.useSecondary !== next) {
+      s.useSecondary = next;
+      bumpSecondaryConfigRevision();
+      saveSettingsDebounced();
+    }
+    if (next && secondaryConfigured(s)) queueMemoryJob('副API已启用，继续补齐记忆', 120);
   });
   $('#am_secondary_preset_select').on('change', function () { loadSecondaryPreset(this.value); });
   $('#am_save_secondary_preset').on('click', () => saveSecondaryPreset({ overwriteActive: false }));
