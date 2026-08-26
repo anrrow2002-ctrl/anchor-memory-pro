@@ -51,76 +51,123 @@ export function estimateTextTokens(text) {
   return Math.max(0, Math.ceil(cjk * 0.82 + other / 3.8));
 }
 
+function fitPrefixByTokens(source, tokenBudget) {
+  let low = 0;
+  let high = source.length;
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2);
+    if (estimateTextTokens(source.slice(0, mid)) <= tokenBudget) low = mid;
+    else high = mid - 1;
+  }
+  return source.slice(0, low);
+}
+
+function fitSuffixByTokens(source, tokenBudget) {
+  let low = 0;
+  let high = source.length;
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2);
+    if (estimateTextTokens(source.slice(-mid)) <= tokenBudget) low = mid;
+    else high = mid - 1;
+  }
+  return source.slice(-low);
+}
+
+function fitWindowByTokens(source, centerRatio, tokenBudget) {
+  if (!source || tokenBudget <= 0) return { start: 0, end: 0, text: '' };
+  const center = Math.max(0, Math.min(source.length, Math.floor(source.length * centerRatio)));
+  // Grow symmetrically around the requested center, then snap outward to nearby line/sentence boundaries.
+  let low = 1;
+  let high = source.length;
+  let bestStart = center;
+  let bestEnd = Math.min(source.length, center + 1);
+  while (low <= high) {
+    const span = Math.floor((low + high) / 2);
+    const start = Math.max(0, center - Math.floor(span / 2));
+    const end = Math.min(source.length, start + span);
+    if (estimateTextTokens(source.slice(start, end)) <= tokenBudget) {
+      bestStart = start;
+      bestEnd = end;
+      low = span + 1;
+    } else {
+      high = span - 1;
+    }
+  }
+  const boundary = /[\n。！？!?；;]/;
+  let start = bestStart;
+  let end = bestEnd;
+  for (let i = bestStart; i > Math.max(0, bestStart - 100); i--) {
+    if (boundary.test(source[i - 1] || '')) { start = i; break; }
+  }
+  for (let i = bestEnd; i < Math.min(source.length, bestEnd + 100); i++) {
+    if (boundary.test(source[i] || '')) { end = i + 1; break; }
+  }
+  let text = source.slice(start, end).trim();
+  if (estimateTextTokens(text) > tokenBudget) text = fitPrefixByTokens(text, tokenBudget).trim();
+  return { start, end, text };
+}
+
 export function clampTextByTokens(text, maxTokens, headRatio = 0.34, markerText = '…（因本次上下文预算已裁剪）…') {
   const value = String(text || '').trim();
   const budget = Math.max(0, Math.floor(Number(maxTokens) || 0));
   if (!value || budget <= 0) return '';
   if (estimateTextTokens(value) <= budget) return value;
 
-  const lines = value.split(/\r?\n/);
-  const marker = `\n${String(markerText || '…（因本次上下文预算已裁剪）…').trim()}\n`;
+  const markerCore = String(markerText || '…（因本次上下文预算已裁剪）…').trim();
+  const marker = `\n${markerCore}\n`;
   const markerCost = estimateTextTokens(marker);
-  const usable = Math.max(1, budget - markerCost);
-  const headBudget = Math.max(1, Math.floor(usable * Math.max(0.1, Math.min(0.9, headRatio))));
-  const tailBudget = Math.max(1, usable - headBudget);
+  // Preserve four chronological windows rather than deleting one enormous middle block. This is
+  // especially important for long RP memory where an item/event may live anywhere in the history.
+  const markerCount = 3;
+  const usable = Math.max(1, budget - markerCost * markerCount);
+  const requestedHead = Math.max(0.18, Math.min(0.42, Number(headRatio) || 0.34));
+  const headBudget = Math.max(1, Math.floor(usable * requestedHead));
+  const tailBudget = Math.max(1, Math.floor(usable * 0.34));
+  const middleBudget = Math.max(1, usable - headBudget - tailBudget);
+  const middleOneBudget = Math.max(1, Math.floor(middleBudget / 2));
+  const middleTwoBudget = Math.max(1, middleBudget - middleOneBudget);
 
-  const head = [];
-  let headCost = 0;
-  for (const line of lines) {
-    const cost = estimateTextTokens(`${line}\n`);
-    if (headCost + cost > headBudget) break;
-    head.push(line);
-    headCost += cost;
-  }
+  const head = fitPrefixByTokens(value, headBudget).trim();
+  const middleOne = fitWindowByTokens(value, 0.40, middleOneBudget);
+  const middleTwo = fitWindowByTokens(value, 0.68, middleTwoBudget);
+  const tail = fitSuffixByTokens(value, tailBudget).trim();
 
-  const tail = [];
-  let tailCost = 0;
-  for (let index = lines.length - 1; index >= 0; index--) {
-    const line = lines[index];
-    const cost = estimateTextTokens(`${line}\n`);
-    if (tailCost + cost > tailBudget) break;
-    tail.unshift(line);
-    tailCost += cost;
-  }
+  const windows = [
+    { start: 0, end: head.length, text: head },
+    middleOne,
+    middleTwo,
+    { start: Math.max(0, value.length - tail.length), end: value.length, text: tail },
+  ].filter(window => window.text);
+  windows.sort((a, b) => a.start - b.start);
 
-  if (head.length === 0 && tail.length === 0) {
-    // A very long single line cannot contribute a whole line to either side. Preserve the
-    // truncation marker anyway, otherwise callers cannot tell that the middle is missing.
-    if (markerCost < budget) {
-      const fitChars = (source, tokenBudget, fromEnd = false) => {
-        let low = 0;
-        let high = source.length;
-        while (low < high) {
-          const mid = Math.ceil((low + high) / 2);
-          const sample = fromEnd ? source.slice(-mid) : source.slice(0, mid);
-          if (estimateTextTokens(sample) <= tokenBudget) low = mid;
-          else high = mid - 1;
-        }
-        return fromEnd ? source.slice(-low) : source.slice(0, low);
-      };
-      const charUsable = Math.max(2, budget - markerCost);
-      const charHeadBudget = Math.max(1, Math.floor(charUsable * Math.max(0.1, Math.min(0.9, headRatio))));
-      const charTailBudget = Math.max(1, charUsable - charHeadBudget);
-      const headText = fitChars(value, charHeadBudget, false);
-      const tailText = fitChars(value, charTailBudget, true);
-      const result = `${headText}${marker}${tailText}`;
-      if (estimateTextTokens(result) <= budget) return result;
+  const merged = [];
+  for (const window of windows) {
+    const previous = merged[merged.length - 1];
+    if (previous && window.start <= previous.end + 8) {
+      const combinedStart = previous.start;
+      const combinedEnd = Math.max(previous.end, window.end);
+      previous.start = combinedStart;
+      previous.end = combinedEnd;
+      previous.text = value.slice(combinedStart, combinedEnd).trim();
+    } else {
+      merged.push({ ...window });
     }
-
-    let low = 0;
-    let high = value.length;
-    while (low < high) {
-      const mid = Math.ceil((low + high) / 2);
-      if (estimateTextTokens(value.slice(0, mid)) <= budget) low = mid;
-      else high = mid - 1;
-    }
-    return `${value.slice(0, Math.max(1, low - 1))}…`;
   }
+  if (merged.length === 1 && estimateTextTokens(merged[0].text) <= budget) return merged[0].text;
 
-  const overlap = head.length + tail.length >= lines.length;
-  const result = overlap ? value : `${head.join('\n')}${marker}${tail.join('\n')}`;
+  let result = merged.map(window => window.text).join(marker);
+  // Boundary snapping may have added a few tokens. Trim the final window first instead of erasing
+  // another middle section.
+  if (estimateTextTokens(result) > budget && merged.length > 1) {
+    const fixed = merged.slice(0, -1).map(window => window.text).join(marker);
+    const remaining = Math.max(1, budget - estimateTextTokens(fixed) - markerCost);
+    const clippedTail = fitSuffixByTokens(merged.at(-1).text, remaining).trim();
+    result = [fixed, clippedTail].filter(Boolean).join(marker);
+  }
   if (estimateTextTokens(result) <= budget) return result;
-  return clampTextByTokens(result.replace(marker, '\n…\n'), budget, headRatio, '…');
+  const ellipsis = '…';
+  const ellipsisCost = estimateTextTokens(ellipsis);
+  return `${fitPrefixByTokens(result, Math.max(1, budget - ellipsisCost)).trimEnd()}${ellipsis}`;
 }
 
 export function resolveAdaptiveMemoryBudget({

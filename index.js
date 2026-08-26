@@ -29,6 +29,14 @@ import {
   lockCompletedSummaryToSavedSnapshot,
 } from './core/summary-lifecycle.js';
 import {
+  chunkNarrativeText,
+  rawChunkId,
+  rawFloorVectorId,
+  itemAliasTokens,
+  queryMatchesItemName,
+  sampleTimelineEvents,
+} from './core/detail-memory.js';
+import {
   normalizeOpenAiCompatibleBaseUrl,
   openAiCompatibleProviderInfo,
   providerCompatibilityHint,
@@ -148,15 +156,15 @@ function isGenerationActive() {
 
 
 const MODULE = 'anchor_memory';
-const EXTENSION_VERSION = '1.0.5';
+const EXTENSION_VERSION = '1.1.0';
 const DATA_KEY = 'anchorMemory';
 const CORE_PROMPT_KEY = 'anchor_memory_core';
 const RECALL_PROMPT_KEY = 'anchor_memory_recall';
-const DATA_VERSION = 13;
+const DATA_VERSION = 14;
 const RELATIONSHIP_SCHEMA_VERSION = 2;
 const RELATIONSHIP_CHECKPOINT_INTERVAL = 10;
 const VECTOR_DB_NAME = 'anchor-memory-vectors';
-const VECTOR_DB_VERSION = 1;
+const VECTOR_DB_VERSION = 2;
 const VECTOR_STORE_NAME = 'vectors';
 const MESSAGE_RENDER_MARGIN_PX = 1400;
 const MESSAGE_RENDER_RECENT_COUNT = 16;
@@ -188,7 +196,12 @@ const RECENT_FACTS_MEMORY_CHAR_BUDGET = 3800;
 const RECENT_READY_SUMMARY_TOTAL_CHAR_BUDGET = 3300;
 const MISSING_RAW_FALLBACK_TOTAL_CHAR_BUDGET = 900;
 const MISSING_RAW_FALLBACK_ANCHOR_TOTAL_CHAR_BUDGET = 18000;
-const DYNAMIC_RECALL_MEMORY_CHAR_BUDGET = 3200;
+const DYNAMIC_RECALL_DETAIL_TOKEN_BUDGET = 2600;
+const RAW_DETAIL_CHUNK_TARGET_TOKENS = 560;
+const RAW_DETAIL_CHUNK_MAX_TOKENS = 720;
+const RAW_DETAIL_CHUNK_OVERLAP_TOKENS = 90;
+const RAW_DETAIL_CANDIDATE_FLOORS = 10;
+const RAW_DETAIL_NEIGHBOR_RADIUS = 1;
 // Remote embedding APIs can occasionally be slow. Give the semantic side of hybrid recall a short, bounded window
 // before the main request is sent, then fall back to deterministic keyword recall rather than
 // allowing a late network result to arrive after the model has already started responding.
@@ -286,9 +299,10 @@ const LEGACY_MERGE_RULES_099 = `全量合并规则：
 
 const DEFAULT_MERGE_RULES = `全量合并规则：
 - 将上一次历史锚点与本周期新增记忆无缝合并为一份新的累计历史锚点；只输出“历史锚点简述”。
-- 极致压缩 Token：优先保留核心冲突、关系阶段转变、重要决定、关键伏笔、关键道具和会影响后续理解的原话；删除氛围铺陈、重复动作、同义对话、日常过渡与无后果细节。
+- 压缩措辞而不是反复删除事实：优先合并重复表述、氛围铺陈和无后果过渡；已经进入累计历史的有名人物、明确日期、关键道具、承诺、决定、伤害/失去/获得、地点变化及其因果结果，不得仅因“属于旧历史”而在下一次合并中消失。
 - 禁止按每个场景、每顿饭、每次消息或每轮对话拆成流水账。同一剧情日内、围绕同一目标/冲突连续推进的多个场景，必须合并成一条完整事件链；只有核心矛盾、关系阶段、行动目标或剧情日期发生实质变化时才另起一条。
-- 上一次历史锚点属于旧历史，应进一步压缩；本周期新增事件保留更完整的动作、关键原话与结果，但仍需合并同日连续情节，避免逐楼复述。
+- 旧历史允许进一步缩短句子，但必须维持可恢复的事件粒度：至少保留“何时/谁/发生了什么/为何/结果或后续影响”，以及会被后续再次引用的道具、伏笔和必要原话。禁止把具体事件继续压成“关系发生变化”“发生冲突”等空骨架。
+- 本周期新增事件保留更完整的动作、关键原话与结果；同日连续情节可合并，但不得把彼此无关的事件强行揉成一句。
 - 按剧情时间顺序分条。不得把跨度超过一个月的事件合并为单条；跨月必须拆分。一个月以内也不能把彼此无关的主线强行合并。
 - 每条必须保留完整因果链：起因 -> 核心冲突/推进 -> 结果/影响；关键对话须注明说话人，重要伏笔与道具不得因压缩而消失。
 - 全部使用第三人称，只写已经发生且有依据的剧情，不预测、不评价，不分析 {{user}} 或额外输出人物动态。
@@ -424,6 +438,7 @@ const state = {
   pendingInjectionContent: '',
   vectorDbPromise: null,
   vectorCache: new Map(),
+  vectorKindCache: new Map(),
   vectorMigrationStorageIds: new Set(),
   recallPrefetchKey: '',
   recallPrefetchPromise: null,
@@ -532,7 +547,10 @@ function settings() {
         && /只输出[“"]历史锚点简述[”"]/.test(storedMergeRules)
         && /不得把跨度超过一个月的事件合并为单条/.test(storedMergeRules)
         && /起因\s*[-=]>\s*核心冲突\s*[-=]>\s*结果\/影响/.test(storedMergeRules));
-    if (looksLikeUntouchedLegacyMergeRules) {
+    if (looksLikeUntouchedLegacyMergeRules
+        || (/极致压缩 Token/.test(storedMergeRules)
+          && /上一次历史锚点属于旧历史，应进一步压缩/.test(storedMergeRules)
+          && /重要伏笔与道具不得因压缩而消失/.test(storedMergeRules))) {
       s.mergeRules = DEFAULT_MERGE_RULES;
     }
     // 0.9.1 shipped keyword dynamic recall as an implicit default. 0.9.2 restores strict layered
@@ -748,6 +766,7 @@ function defaultData() {
       scenes: { byKey: {}, order: [], updatedAt: 0 },
       itemTombstones: {},
       sceneTombstones: {},
+      itemEvents: { byKey: {}, updatedAt: 0 },
     },
     // Fixed-schema relationship table. Users control the row names; the background AI may only
     // update the three relationship-state columns for those existing rows.
@@ -786,6 +805,9 @@ function defaultData() {
       relationshipLastGoodAt: 0,
       relationshipRebuildFailures: 0,
       sourceHashSchema: SOURCE_HASH_SCHEMA_VERSION,
+      detailVectorSchema: 1,
+      detailIndexNeedsRebuild: false,
+      detailIndexUpdatedAt: 0,
       lastAnchorFloor: -1,
       lastMergeFloor: -1,
       godlogCount: 0,
@@ -1454,12 +1476,14 @@ function memoryData() {
     }
   }
   const hadEntities = !!(data.entities && data.entities.items && data.entities.scenes);
+  const hadItemEvents = !!(data.entities?.itemEvents && data.entities.itemEvents.byKey);
   const hadTimeline = !!(data.timeline && Array.isArray(data.timeline.history));
   ensureEntityState(data);
   ensureTimelineState(data);
   syncEntityLedgers(data);
+  if (!hadItemEvents) refreshItemEventTimeline(data, { force: true });
   refreshTimelineFromGodlogs(data);
-  if (!hadEntities || !hadTimeline) migrationTouched = true;
+  if (!hadEntities || !hadItemEvents || !hadTimeline) migrationTouched = true;
   const hadRelationshipTable = !!(data.relationshipTable && typeof data.relationshipTable === 'object' && Array.isArray(data.relationshipTable.rows));
   data.relationshipTable = normalizeRelationshipTable(data.relationshipTable, data.codex.relationship || '');
   data.codex.relationship = relationshipTableMarkdown(data.relationshipTable, false);
@@ -1480,6 +1504,10 @@ function memoryData() {
         : value && typeof value === 'object' ? { ...value }
           : value;
     }
+  }
+  if (priorDataVersion > 0 && priorDataVersion < 14 && chatRows(true).some(row => row.role === 'assistant')) {
+    data.processing.detailIndexNeedsRebuild = true;
+    migrationTouched = true;
   }
   if (data.processing.pendingPromptInjection?.content) {
     const content = String(data.processing.pendingPromptInjection.content || '');
@@ -2258,28 +2286,28 @@ function cleanText(text) {
 
 
 function normalizeAnchorBody(text, number) {
-  let value = cleanText(stripGodlogFenceBlocks(String(text || '')))
+  let value = cleanText(stripGodlogFenceBlocks(String(text || '').replace(/<AnchorMemoryEnd\s*\/?\s*>/gi, '')))
     .replace(/<[^>]+>/g, '')
     .trim();
   const markerIndex = value.search(/\*\*本次新增锚点[：:]?\*\*/i);
   if (markerIndex >= 0) value = value.slice(markerIndex).replace(/^\*\*本次新增锚点[：:]?\*\*\s*/i, '');
   value = value
     .replace(/^###\s*第\s*\d+\s*次锚点记录\s*/im, '')
-    .replace(/\n(?:#{1,6}|\*\*【)[\s\S]*$/m, '')
+    .replace(/^\s*(?:#{1,6}\s+|\*\*【).*$/gm, '')
     .replace(/^\|.*\|\s*$/gm, '')
     .trim();
   return `### 第 ${number} 次锚点记录\n\n**本次新增锚点：**\n${value}`.trim();
 }
 
 function normalizeMergeBody(text, number) {
-  let value = cleanText(stripGodlogFenceBlocks(String(text || '')))
+  let value = cleanText(stripGodlogFenceBlocks(String(text || '').replace(/<AnchorMemoryEnd\s*\/?\s*>/gi, '')))
     .replace(/<[^>]+>/g, '')
     .trim();
   const markerIndex = value.search(/\*\*历史锚点简述\*\*/i);
   if (markerIndex >= 0) value = value.slice(markerIndex).replace(/^\*\*历史锚点简述\*\*\s*/i, '');
   value = value
     .replace(/^###\s*第\s*\d+\s*次全量合并锚点\s*/im, '')
-    .replace(/\n(?:#{1,6}|\*\*【)[\s\S]*$/m, '')
+    .replace(/^\s*(?:#{1,6}\s+|\*\*【).*$/gm, '')
     .replace(/^\|.*\|\s*$/gm, '')
     .trim();
   return `### 第 ${number} 次全量合并锚点\n\n**历史锚点简述**\n${value}`.trim();
@@ -3609,11 +3637,123 @@ function ensureEntityState(data) {
   if (!data.entities.scenes || typeof data.entities.scenes !== 'object') data.entities.scenes = { byKey: {}, order: [], updatedAt: 0 };
   if (!data.entities.itemTombstones || typeof data.entities.itemTombstones !== 'object') data.entities.itemTombstones = {};
   if (!data.entities.sceneTombstones || typeof data.entities.sceneTombstones !== 'object') data.entities.sceneTombstones = {};
+  if (!data.entities.itemEvents || typeof data.entities.itemEvents !== 'object') data.entities.itemEvents = { byKey: {}, updatedAt: 0, signature: '' };
+  if (!data.entities.itemEvents.byKey || typeof data.entities.itemEvents.byKey !== 'object') data.entities.itemEvents.byKey = {};
   return data.entities;
+}
+
+function itemEventSourceSnippet(row, itemName, maxTokens = 180) {
+  const source = String(row?.turnText || row?.text || '');
+  if (!source) return '';
+  const lower = source.toLocaleLowerCase();
+  const candidates = [String(itemName || '').trim(), ...itemAliasTokens(itemName)]
+    .map(value => String(value || '').trim())
+    .filter(value => value.length >= 2);
+  let index = -1;
+  let matched = '';
+  for (const candidate of candidates) {
+    const at = lower.indexOf(candidate.toLocaleLowerCase());
+    if (at >= 0 && (index < 0 || at < index)) {
+      index = at;
+      matched = candidate;
+    }
+  }
+  if (index < 0) return '';
+  const radius = Math.max(260, Math.min(900, Math.round(maxTokens * 2.4)));
+  const start = Math.max(0, index - Math.floor(radius * 0.42));
+  const end = Math.min(source.length, index + Math.max(matched.length, 1) + Math.floor(radius * 0.58));
+  return clampTextByTokens(source.slice(start, end).trim(), maxTokens, 0.5, '…（同楼细节省略）…');
+}
+
+function buildItemEventForRow(data, item, row) {
+  if (!item?.name || !row?.key) return null;
+  const rawText = String(row.turnText || row.text || '');
+  const godlog = godlogForRow(data, row);
+  const godlogText = isGodlogReady(godlog, row) ? safeGodlogMemoryText(godlog.body || '') : '';
+  const aliases = itemAliasTokens(item.name);
+  const normalizedRaw = normalizeEntityMatchText(rawText);
+  const normalizedGodlog = normalizeEntityMatchText(godlogText);
+  const mentionedInRaw = aliases.some(alias => normalizedRaw.includes(alias));
+  const mentionedInGodlog = aliases.some(alias => normalizedGodlog.includes(alias));
+  if (!mentionedInRaw && !mentionedInGodlog) return null;
+
+  const cond = mentionedInGodlog ? godlogFieldValue(godlog?.body || '', 'Cond') : '';
+  const summary = cond
+    ? clampTextByTokens(cond, 150, 0.52, '…')
+    : itemEventSourceSnippet(row, item.name, 150);
+  if (!summary) return null;
+  return {
+    id: `item_event_${stableHash(`${item.id || item.key}|${row.key}|${row.rawHash || ''}`)}`,
+    floor: Number(row.index ?? -1),
+    assistantNumber: Number(row.assistantNumber || 0),
+    key: row.key,
+    rawHash: row.rawHash || '',
+    time: godlogText ? (godlogFieldValue(godlog?.body || '', 'Time') || '未明') : '未明',
+    title: mentionedInGodlog ? (godlogFieldValue(godlog?.body || '', 'Title') || `提及${item.name}`) : `原文提及${item.name}`,
+    summary,
+    source: mentionedInGodlog ? 'godlog+raw' : 'raw',
+    godlogId: mentionedInGodlog ? (godlog?.id || '') : '',
+  };
+}
+
+function refreshItemEventTimeline(data, options = {}) {
+  const entities = ensureEntityState(data);
+  const itemKeys = (entities.items?.order || []).filter(key => entities.items?.byKey?.[key]);
+  if (!itemKeys.length) {
+    entities.itemEvents = { byKey: {}, updatedAt: Date.now(), signature: '' };
+    return entities.itemEvents;
+  }
+  const rows = chatRows(true).filter(row => row.role === 'assistant');
+  const requestedRow = options.row?.key ? options.row : null;
+  const signature = stableHash(JSON.stringify({
+    items: itemKeys,
+    rows: requestedRow ? [] : rows.map(row => [row.key, row.rawHash]),
+    godlogs: requestedRow ? [] : (data.godlogs || []).filter(item => item?.status === 'ready' && !item.stale).map(item => [item.id, item.key, item.rawHash, item.updatedAt]),
+  }));
+  if (!requestedRow && !options.force && entities.itemEvents.signature === signature) return entities.itemEvents;
+
+  if (requestedRow) {
+    for (const key of itemKeys) {
+      const item = entities.items.byKey[key];
+      const existing = Array.isArray(entities.itemEvents.byKey[key]) ? entities.itemEvents.byKey[key] : [];
+      const kept = existing.filter(event => event?.key !== requestedRow.key);
+      const event = buildItemEventForRow(data, item, requestedRow);
+      if (event) kept.push(event);
+      kept.sort((a, b) => Number(a.floor ?? -1) - Number(b.floor ?? -1));
+      entities.itemEvents.byKey[key] = sampleTimelineEvents(kept, 96);
+    }
+    entities.itemEvents.updatedAt = Date.now();
+    entities.itemEvents.signature = '';
+    return entities.itemEvents;
+  }
+
+  const requestedKeys = Array.isArray(options.onlyKeys)
+    ? [...new Set(options.onlyKeys)].filter(key => itemKeys.includes(key))
+    : itemKeys;
+  const byKey = Array.isArray(options.onlyKeys) ? { ...(entities.itemEvents?.byKey || {}) } : {};
+  for (const key of Object.keys(byKey)) if (!itemKeys.includes(key)) delete byKey[key];
+  for (const key of requestedKeys) {
+    const item = entities.items.byKey[key];
+    const events = [];
+    for (const row of rows) {
+      const event = buildItemEventForRow(data, item, row);
+      if (event) events.push(event);
+    }
+    byKey[key] = sampleTimelineEvents(events, 96);
+  }
+  entities.itemEvents = {
+    byKey,
+    updatedAt: Date.now(),
+    // A partial backfill intentionally clears the full-signature cache; the next explicit full
+    // rebuild can still verify every item, while normal prompt-time lookup never triggers it.
+    signature: Array.isArray(options.onlyKeys) ? '' : signature,
+  };
+  return entities.itemEvents;
 }
 
 function syncEntityLedgers(data, options = {}) {
   const entities = ensureEntityState(data);
+  const previousItemKeys = [...(entities.items?.order || [])];
   const itemRows = parseMarkdownTable(data.codex?.itemIndex || '').map(row => ({
     name: firstTableValue(row, ['物品/细节/内部梗', '物品', '细节', '内部梗'], ['物品', '细节', '内部梗']),
     boundTo: firstTableValue(row, ['绑定人物', '相关人物', '持有者'], ['绑定', '人物', '持有']),
@@ -3634,6 +3774,15 @@ function syncEntityLedgers(data, options = {}) {
   }
   entities.items = buildItemLedger(itemRows, entities.items, entities.itemTombstones);
   entities.scenes = buildSceneLedger(sceneRows, entities.scenes, entities.sceneTombstones);
+  const nextItemKeys = [...(entities.items?.order || [])];
+  const previousSet = new Set(previousItemKeys);
+  const nextSet = new Set(nextItemKeys);
+  const addedItemKeys = nextItemKeys.filter(key => !previousSet.has(key));
+  const removedItemKeys = previousItemKeys.filter(key => !nextSet.has(key));
+  for (const key of removedItemKeys) delete entities.itemEvents?.byKey?.[key];
+  // Only a newly discovered item needs a historical backfill. Existing item timelines are maintained
+  // incrementally per completed AI floor, so adding one item at floor 5000 does not rescan 30 old items.
+  if (addedItemKeys.length) refreshItemEventTimeline(data, { force: true, onlyKeys: addedItemKeys });
   return entities;
 }
 
@@ -4199,6 +4348,23 @@ async function callWriter(prompt, maxTokens = 3200) {
     ], maxTokens);
   }
   throw new Error('锚点/合并后台整理需要先配置并启用副API；为避免把记忆整理提示词发送给主模型，本版本不再使用主模型静默整理。');
+}
+
+function hasDerivedMemoryEndSentinel(text) {
+  return /<AnchorMemoryEnd\s*\/?\s*>\s*$/i.test(String(text || ''));
+}
+
+async function callDerivedWriter(prompt, maxTokens = 3200, label = '记忆整理') {
+  const sentinelInstruction = '\n\n完整性校验：最终输出的最后一行必须严格写 <AnchorMemoryEnd/>。这只是后台完整性标记，不属于剧情内容。';
+  const fullPrompt = `${prompt}${sentinelInstruction}`;
+  let raw = await callWriter(fullPrompt, maxTokens);
+  if (hasDerivedMemoryEndSentinel(raw)) return raw;
+  // Some OpenAI-compatible providers incorrectly report finish_reason=stop for a truncated body.
+  // Retry once with a larger ceiling and an explicit warning instead of persisting a half-written anchor.
+  const retryBudget = Math.min(12000, Math.max(Number(maxTokens) + 1600, Math.ceil(Number(maxTokens) * 1.55)));
+  raw = await callWriter(`${fullPrompt}\n\n上一次输出缺少完整性标记，疑似被接口静默截断。请从头完整重写，绝不能省略末尾标记。`, retryBudget);
+  if (!hasDerivedMemoryEndSentinel(raw)) throw new Error(`${label}输出缺少完整性标记，疑似被接口截断；已拒绝保存不完整结果`);
+  return raw;
 }
 
 async function callSummaryWriter(prompt, maxTokens = 1000) {
@@ -4946,7 +5112,7 @@ async function rewriteAnchorItemUnlocked(data, anchor, contextToken) {
   showStatus(`正在重写第 ${anchor?.number || 1} 次分段锚点`);
   try {
     const number = Number(anchor?.number || 1);
-    const body = normalizeAnchorBody(await callWriter(buildAnchorRewritePrompt(data, anchor, source.materials, source.missingKeys), 5200), number);
+    const body = normalizeAnchorBody(await callDerivedWriter(buildAnchorRewritePrompt(data, anchor, source.materials, source.missingKeys), 5200, '锚点重写'), number);
     if (!isSameChatContext(contextToken)) return false;
     if (!body || body.trim().length < 100) throw new Error('重写后的锚点内容为空或过短');
 
@@ -4988,7 +5154,7 @@ async function rewriteMergeItemUnlocked(data, merge, contextToken) {
     const prompt = plan.cycleSourceKeys.length
       ? buildMergeSourceRewritePrompt(data, merge, plan)
       : buildMergeRewritePrompt(data, merge);
-    const body = normalizeMergeBody(await callWriter(prompt, 6200), number);
+    const body = normalizeMergeBody(await callDerivedWriter(prompt, 6200, '累计历史重写'), number);
     if (!isSameChatContext(contextToken)) return false;
     if (!body || body.trim().length < 120) throw new Error('重写后的合并内容为空或过短');
 
@@ -5253,6 +5419,50 @@ function matchedPeopleInjectionBlock(data, chat, codexOverride = undefined) {
   return `${codexSafeSnapshotPrefix(data, '出场人物表', !!codex)}${content}`;
 }
 
+function itemEventCandidateKeys(data, query, maxKeys = 16) {
+  const entities = ensureEntityState(data);
+  const matchedKeys = (entities.items?.order || [])
+    .filter(key => entities.items?.byKey?.[key] && queryMatchesItemName(query, entities.items.byKey[key].name));
+  if (!matchedKeys.length) return [];
+  const events = matchedKeys.flatMap(key => entities.itemEvents?.byKey?.[key] || [])
+    .filter(event => event?.key)
+    .sort((a, b) => Number(b.floor ?? -1) - Number(a.floor ?? -1));
+  const selected = [];
+  const seen = new Set();
+  for (const event of events) {
+    if (seen.has(event.key)) continue;
+    seen.add(event.key);
+    selected.push(event.key);
+    if (selected.length >= Math.max(1, Number(maxKeys) || 16)) break;
+  }
+  return selected;
+}
+
+function itemEventTimelineInjectionBlock(data, chat, maxEventsPerItem = 12) {
+  const entities = ensureEntityState(data);
+  const query = recentNarrativeQuery(chat, 6);
+  const matchedKeys = (entities.items?.order || [])
+    .filter(key => entities.items?.byKey?.[key] && queryMatchesItemName(query, entities.items.byKey[key].name));
+  if (!matchedKeys.length) return '';
+  const parts = ['#### 相关道具事件线'];
+  for (const key of matchedKeys.slice(0, 4)) {
+    const item = entities.items.byKey[key];
+    const allEvents = [...(entities.itemEvents?.byKey?.[key] || [])]
+      .sort((a, b) => Number(a.floor ?? -1) - Number(b.floor ?? -1));
+    if (!allEvents.length) continue;
+    const limit = Math.max(3, Number(maxEventsPerItem) || 12);
+    const events = sampleTimelineEvents(allEvents, limit);
+    parts.push(`**${item.name}｜按剧情顺序**`);
+    for (const event of events) {
+      const floorLabel = event.assistantNumber > 0 ? `第${event.assistantNumber}个AI回合` : `楼层${event.floor}`;
+      const time = event.time && event.time !== '未明' ? `${event.time}｜` : '';
+      parts.push(`- ${time}${floorLabel}｜${event.title}：${event.summary}`);
+    }
+    if (allEvents.length > events.length) parts.push(`- …另有 ${allEvents.length - events.length} 条较早/中间事件保存在事件链中，必要时由原文细节召回补充。`);
+  }
+  return parts.length > 1 ? parts.join('\n') : '';
+}
+
 function importantItemsInjectionBlock(data, chat, codexOverride = undefined) {
   if (!settings().injectImportantItems) return '（重要物品表注入未启用）';
   const codex = codexOverride === undefined ? injectionCodex(data) : codexOverride;
@@ -5263,7 +5473,10 @@ function importantItemsInjectionBlock(data, chat, codexOverride = undefined) {
   // The item ledger already contains only plot-relevant items. Prefer current matches, but retain a
   // bounded ledger fallback so an unmentioned but continuously carried key item is not forgotten.
   const content = matched || tableWithLimitedRows(codex.itemIndex, 10) || '（暂无）';
-  return `${codexSafeSnapshotPrefix(data, '重要物品表', !!codex)}${content}`;
+  const timeline = itemEventTimelineInjectionBlock(data, chat);
+  return `${codexSafeSnapshotPrefix(data, '重要物品表', !!codex)}${content}${timeline ? `
+
+${timeline}` : ''}`;
 }
 
 function buildCoreInjection(data, chat = getContext().chat || []) {
@@ -5397,7 +5610,9 @@ function recallCandidateLimit() {
 }
 
 function recallTokenBudget() {
-  return Math.max(2200, Math.min(7200, 1400 + recallMaxCount() * 850));
+  // Selection and rendered injection now share a token budget. Avoid selecting thousands of tokens
+  // only to discard the middle later with a separate character clamp.
+  return Math.max(1600, Math.min(3200, 900 + recallMaxCount() * 500));
 }
 
 function recallHitText(hit, limit = null) {
@@ -5576,7 +5791,7 @@ function keywordRecall(data, query, limit = recallCandidateLimit()) {
 }
 
 function cosine(a, b) {
-  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return 0;
+  if (!isVectorLike(a) || !isVectorLike(b) || a.length !== b.length) return 0;
   let dot = 0;
   let aa = 0;
   let bb = 0;
@@ -5661,6 +5876,23 @@ async function embedTexts(texts) {
     clearTimeout(timeout);
     request.cleanup();
   }
+}
+
+
+async function embedTextsBatched(texts, batchSize = 24) {
+  const values = Array.isArray(texts) ? texts : [];
+  if (!values.length) return [];
+  const size = Math.max(1, Math.min(64, Number(batchSize) || 24));
+  const result = [];
+  for (let offset = 0; offset < values.length; offset += size) {
+    const batch = values.slice(offset, offset + size);
+    const vectors = await embedTexts(batch);
+    if (!Array.isArray(vectors) || vectors.length !== batch.length) {
+      throw new Error(`Embedding API 返回的向量数量不匹配（请求 ${batch.length}，返回 ${Array.isArray(vectors) ? vectors.length : 0}）`);
+    }
+    result.push(...vectors);
+  }
+  return result;
 }
 
 function looksLikeEmbeddingModel(id) {
@@ -5933,6 +6165,48 @@ function idbTransactionDone(transaction) {
   });
 }
 
+function inferVectorRecordKind(id = '') {
+  const value = String(id || '');
+  if (value.startsWith('am_raw_chunk_')) return 'raw-chunk';
+  if (value.startsWith('am_raw_floor_')) return 'raw-floor';
+  if (value.startsWith('am_raw_recall_')) return 'raw-recall';
+  if (value.startsWith('am_godlog_')) return 'godlog';
+  return 'memory';
+}
+
+function isVectorLike(value) {
+  return Array.isArray(value) || ArrayBuffer.isView(value);
+}
+
+function compactVector(value) {
+  if (!isVectorLike(value)) return null;
+  return value instanceof Float32Array ? value : new Float32Array(value);
+}
+
+function storageKindKey(storageId, kind) {
+  return `${storageId}:${String(kind || 'memory')}`;
+}
+
+function storageMessageKey(storageId, messageKey) {
+  return `${storageId}:${String(messageKey || '')}`;
+}
+
+function upsertVectorKindCache(record) {
+  const cacheKey = record?.storageKind;
+  if (!cacheKey || !state.vectorKindCache.has(cacheKey)) return;
+  const records = state.vectorKindCache.get(cacheKey) || [];
+  const at = records.findIndex(item => item?.id === record.id);
+  if (at >= 0) records[at] = record;
+  else records.push(record);
+  state.vectorKindCache.set(cacheKey, records);
+}
+
+function removeVectorKindCacheRecord(storageId, kind, id) {
+  const cacheKey = storageKindKey(storageId, kind);
+  if (!state.vectorKindCache.has(cacheKey)) return;
+  state.vectorKindCache.set(cacheKey, (state.vectorKindCache.get(cacheKey) || []).filter(record => record?.id !== id));
+}
+
 async function openVectorDb() {
   if (!globalThis.indexedDB) return null;
   if (state.vectorDbPromise) return state.vectorDbPromise;
@@ -5944,6 +6218,25 @@ async function openVectorDb() {
         ? request.transaction.objectStore(VECTOR_STORE_NAME)
         : db.createObjectStore(VECTOR_STORE_NAME, { keyPath: 'key' });
       if (!store.indexNames.contains('storageId')) store.createIndex('storageId', 'storageId', { unique: false });
+      if (!store.indexNames.contains('storageKind')) store.createIndex('storageKind', 'storageKind', { unique: false });
+      if (!store.indexNames.contains('storageMessageKey')) store.createIndex('storageMessageKey', 'storageMessageKey', { unique: false });
+
+      // v2 migration: add searchable kind/message metadata to legacy records. Do not rewrite
+      // legacy vectors into chat metadata; IndexedDB remains a disposable local search index.
+      if (request.oldVersion < 2) {
+        const cursorRequest = store.openCursor();
+        cursorRequest.onsuccess = event => {
+          const cursor = event.target.result;
+          if (!cursor) return;
+          const record = cursor.value || {};
+          const kind = record.kind || inferVectorRecordKind(record.id);
+          record.kind = kind;
+          if (record.storageId) record.storageKind = storageKindKey(record.storageId, kind);
+          if (record.storageId && record.messageKey) record.storageMessageKey = storageMessageKey(record.storageId, record.messageKey);
+          cursor.update(record);
+          cursor.continue();
+        };
+      }
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error || new Error('无法打开向量 IndexedDB'));
@@ -5956,32 +6249,94 @@ async function openVectorDb() {
   return state.vectorDbPromise;
 }
 
-async function putStoredVector(data, id, record) {
+async function putStoredVector(data, id, record, options = {}) {
   if (!data || !id || !record?.vector) return false;
   const storageId = ensureVectorStorageId(data);
   const key = `${storageId}:${id}`;
-  const stored = { ...record, key, storageId, id: String(id) };
+  const kind = record.kind || inferVectorRecordKind(id);
+  const vector = compactVector(record.vector);
+  if (!vector) return false;
+  const stored = {
+    ...record,
+    vector,
+    key,
+    storageId,
+    id: String(id),
+    kind,
+    storageKind: storageKindKey(storageId, kind),
+    storageMessageKey: record.messageKey ? storageMessageKey(storageId, record.messageKey) : '',
+  };
   const db = await openVectorDb();
   if (!db) {
-    // Never place large float arrays back into chat metadata. Long chats would otherwise become
-    // progressively larger and slower to save. Dynamic recall transparently falls back to keywords.
     delete data.vectors?.[id];
-    delete data.vectorRefs?.[id];
+    if (options.trackRef !== false) delete data.vectorRefs?.[id];
     state.vectorStorageUnavailable = true;
     return false;
   }
   const tx = db.transaction(VECTOR_STORE_NAME, 'readwrite');
   tx.objectStore(VECTOR_STORE_NAME).put(stored);
   await idbTransactionDone(tx);
-  state.vectorCache.set(key, stored);
-  data.vectorRefs[id] = {
-    signature: record.signature || '',
-    dimensions: record.dimensions || record.vector.length,
-    model: record.model || '',
-    updatedAt: record.updatedAt || Date.now(),
-  };
+  if (kind !== 'raw-chunk') state.vectorCache.set(key, stored);
+  upsertVectorKindCache(stored);
+  if (options.trackRef !== false) {
+    data.vectorRefs[id] = {
+      signature: record.signature || '',
+      dimensions: record.dimensions || vector.length,
+      model: record.model || '',
+      updatedAt: record.updatedAt || Date.now(),
+      kind,
+    };
+  }
   delete data.vectors[id];
   return true;
+}
+
+async function putStoredVectorsBatch(data, entries = []) {
+  const valid = (entries || []).filter(entry => entry?.id && entry?.record?.vector);
+  if (!data || !valid.length) return 0;
+  const storageId = ensureVectorStorageId(data);
+  const db = await openVectorDb();
+  if (!db) {
+    state.vectorStorageUnavailable = true;
+    return 0;
+  }
+  const tx = db.transaction(VECTOR_STORE_NAME, 'readwrite');
+  const store = tx.objectStore(VECTOR_STORE_NAME);
+  let count = 0;
+  for (const entry of valid) {
+    const id = String(entry.id);
+    const record = entry.record || {};
+    const kind = record.kind || inferVectorRecordKind(id);
+    const vector = compactVector(record.vector);
+    if (!vector) continue;
+    const key = `${storageId}:${id}`;
+    const stored = {
+      ...record,
+      vector,
+      key,
+      storageId,
+      id,
+      kind,
+      storageKind: storageKindKey(storageId, kind),
+      storageMessageKey: record.messageKey ? storageMessageKey(storageId, record.messageKey) : '',
+    };
+    store.put(stored);
+    if (kind !== 'raw-chunk') state.vectorCache.set(key, stored);
+    upsertVectorKindCache(stored);
+    if (entry.trackRef !== false) {
+      data.vectorRefs[id] = {
+        signature: record.signature || '',
+        dimensions: record.dimensions || vector.length,
+        model: record.model || '',
+        updatedAt: record.updatedAt || Date.now(),
+        kind,
+      };
+    }
+    delete data.vectors?.[id];
+    count++;
+  }
+  await idbTransactionDone(tx);
+  return count;
 }
 
 async function getStoredVector(data, id) {
@@ -5996,25 +6351,89 @@ async function getStoredVector(data, id) {
   return record || null;
 }
 
-async function listStoredVectors(data) {
+async function listStoredVectorsByKind(data, kinds = []) {
   if (!data) return [];
   const storageId = ensureVectorStorageId(data);
   const db = await openVectorDb();
   if (!db) return [];
+  const result = [];
+  for (const kind of [...new Set(kinds)].filter(Boolean)) {
+    const cacheKey = storageKindKey(storageId, kind);
+    if (state.vectorKindCache.has(cacheKey)) {
+      result.push(...state.vectorKindCache.get(cacheKey));
+      continue;
+    }
+    const tx = db.transaction(VECTOR_STORE_NAME, 'readonly');
+    const records = await idbRequest(tx.objectStore(VECTOR_STORE_NAME).index('storageKind').getAll(cacheKey));
+    for (const record of records || []) state.vectorCache.set(record.key, record);
+    state.vectorKindCache.set(cacheKey, records || []);
+    result.push(...(records || []));
+  }
+  return result;
+}
+
+async function listStoredVectorsForMessageKeys(data, messageKeys = [], kinds = ['raw-chunk']) {
+  if (!data || !messageKeys.length) return [];
+  const storageId = ensureVectorStorageId(data);
+  const db = await openVectorDb();
+  if (!db) return [];
+  const allowedKinds = new Set(kinds || []);
+  const result = [];
   const tx = db.transaction(VECTOR_STORE_NAME, 'readonly');
-  const records = await idbRequest(tx.objectStore(VECTOR_STORE_NAME).index('storageId').getAll(storageId));
-  for (const record of records || []) state.vectorCache.set(record.key, record);
-  return records || [];
+  const index = tx.objectStore(VECTOR_STORE_NAME).index('storageMessageKey');
+  // Schedule all IndexedDB requests before awaiting any of them. Some browsers may auto-close
+  // an otherwise idle transaction between sequential awaits.
+  const uniqueKeys = [...new Set(messageKeys)].filter(Boolean);
+  const batches = await Promise.all(uniqueKeys.map(messageKey =>
+    idbRequest(index.getAll(storageMessageKey(storageId, messageKey)))
+  ));
+  for (const records of batches) {
+    for (const record of records || []) {
+      if (allowedKinds.size && !allowedKinds.has(record.kind || inferVectorRecordKind(record.id))) continue;
+      if ((record.kind || inferVectorRecordKind(record.id)) !== 'raw-chunk') state.vectorCache.set(record.key, record);
+      result.push(record);
+    }
+  }
+  return result;
+}
+
+async function deleteStoredVectorsForMessage(data, messageKey, kinds = []) {
+  if (!data || !messageKey) return 0;
+  const storageId = ensureVectorStorageId(data);
+  const db = await openVectorDb();
+  if (!db) return 0;
+  const allowedKinds = new Set(kinds || []);
+  const readTx = db.transaction(VECTOR_STORE_NAME, 'readonly');
+  const records = await idbRequest(readTx.objectStore(VECTOR_STORE_NAME).index('storageMessageKey').getAll(storageMessageKey(storageId, messageKey)));
+  const removable = (records || []).filter(record => {
+    const kind = record.kind || inferVectorRecordKind(record.id);
+    return !allowedKinds.size || allowedKinds.has(kind);
+  });
+  if (!removable.length) return 0;
+  // Open a fresh write transaction after the async read. This avoids TransactionInactiveError on
+  // WebKit/Safari, which may auto-close a transaction between an awaited request and later deletes.
+  const writeTx = db.transaction(VECTOR_STORE_NAME, 'readwrite');
+  const store = writeTx.objectStore(VECTOR_STORE_NAME);
+  for (const record of removable) {
+    const kind = record.kind || inferVectorRecordKind(record.id);
+    store.delete(record.key);
+    state.vectorCache.delete(record.key);
+    removeVectorKindCacheRecord(storageId, kind, record.id);
+  }
+  await idbTransactionDone(writeTx);
+  return removable.length;
 }
 
 function removeStoredVector(data, id) {
   if (!data || !id) return false;
   const storageId = ensureVectorStorageId(data);
   const key = `${storageId}:${id}`;
-  const existed = !!(data.vectorRefs?.[id] || data.vectors?.[id] || state.vectorCache.has(key));
+  const cached = state.vectorCache.get(key);
+  const existed = !!(data.vectorRefs?.[id] || data.vectors?.[id] || cached);
   delete data.vectorRefs?.[id];
   delete data.vectors?.[id];
   state.vectorCache.delete(key);
+  if (cached?.kind) removeVectorKindCacheRecord(storageId, cached.kind, id);
   openVectorDb().then(db => {
     if (!db) return;
     const tx = db.transaction(VECTOR_STORE_NAME, 'readwrite');
@@ -6028,14 +6447,20 @@ async function clearStoredVectors(data) {
   const storageId = ensureVectorStorageId(data);
   const db = await openVectorDb();
   if (db) {
-    const tx = db.transaction(VECTOR_STORE_NAME, 'readwrite');
-    const store = tx.objectStore(VECTOR_STORE_NAME);
-    const keys = await idbRequest(store.index('storageId').getAllKeys(storageId));
-    for (const key of keys || []) store.delete(key);
-    await idbTransactionDone(tx);
+    const readTx = db.transaction(VECTOR_STORE_NAME, 'readonly');
+    const keys = await idbRequest(readTx.objectStore(VECTOR_STORE_NAME).index('storageId').getAllKeys(storageId));
+    if (keys?.length) {
+      const writeTx = db.transaction(VECTOR_STORE_NAME, 'readwrite');
+      const store = writeTx.objectStore(VECTOR_STORE_NAME);
+      for (const key of keys) store.delete(key);
+      await idbTransactionDone(writeTx);
+    }
   }
   for (const key of [...state.vectorCache.keys()]) {
     if (key.startsWith(`${storageId}:`)) state.vectorCache.delete(key);
+  }
+  for (const key of [...state.vectorKindCache.keys()]) {
+    if (key.startsWith(`${storageId}:`)) state.vectorKindCache.delete(key);
   }
   data.vectorRefs = {};
   data.vectors = {};
@@ -6090,9 +6515,168 @@ async function ensureMemoryItemEmbedded(data, id, text) {
   await embedMemoryItem(data, id, text);
 }
 
-async function vectorRecall(data, query, limit = recallCandidateLimit()) {
+function rawDetailChunksForRow(row) {
+  return chunkNarrativeText(String(row?.turnText || row?.text || ''), {
+    targetTokens: RAW_DETAIL_CHUNK_TARGET_TOKENS,
+    maxTokens: RAW_DETAIL_CHUNK_MAX_TOKENS,
+    overlapTokens: RAW_DETAIL_CHUNK_OVERLAP_TOKENS,
+    minTokens: 140,
+  }).map(chunk => ({
+    ...chunk,
+    id: rawChunkId(row, chunk),
+    messageKey: row?.key || '',
+    floor: Number(row?.index ?? -1),
+    assistantNumber: Number(row?.assistantNumber || 0),
+    rawHash: row?.rawHash || '',
+  }));
+}
+
+function recallVectorEntriesForRow(row, godlog = null, rawFallback = null) {
+  if (!row?.key) return [];
+  const sourceText = String(row.turnText || row.text || '').trim();
+  if (!sourceText) return [];
+  const entries = [];
+  if (godlog && isGodlogReady(godlog, row)) {
+    entries.push({
+      id: godlog.id,
+      text: safeGodlogMemoryText(godlog.body || ''),
+      kind: 'godlog',
+      trackRef: true,
+      meta: { messageKey: row.key, floor: row.index, assistantNumber: row.assistantNumber, rawHash: row.rawHash },
+    });
+  } else if (rawFallback?.id && rawFallback?.body) {
+    entries.push({
+      id: rawFallback.id,
+      text: rawFallback.body,
+      kind: 'raw-recall',
+      trackRef: true,
+      meta: { messageKey: row.key, floor: row.index, assistantNumber: row.assistantNumber, rawHash: row.rawHash },
+    });
+  }
+  for (const chunk of rawDetailChunksForRow(row)) {
+    entries.push({
+      id: chunk.id,
+      text: chunk.text,
+      kind: 'raw-chunk',
+      trackRef: false,
+      meta: {
+        messageKey: row.key,
+        floor: row.index,
+        assistantNumber: row.assistantNumber,
+        rawHash: row.rawHash,
+        chunkIndex: chunk.index,
+        start: chunk.start,
+        end: chunk.end,
+      },
+    });
+  }
+  return entries.filter(entry => String(entry.text || '').trim());
+}
+
+async function persistRecallVectorsForRow(data, row, valid, vectors, options = {}) {
+  if (!row?.key || !valid?.length) return 0;
+  if (!Array.isArray(vectors) || vectors.length !== valid.length) throw new Error('Embedding API 返回的向量数量与原文索引块不一致');
+
+  // Only after the new batch is available do we retire stale detail vectors for this source floor.
+  await deleteStoredVectorsForMessage(data, row.key, ['raw-floor', 'raw-chunk']);
+  const signature = embeddingSignature();
+  const now = Date.now();
+  const batch = valid.map((entry, index) => ({
+    id: entry.id,
+    trackRef: entry.trackRef,
+    record: {
+      vector: vectors[index],
+      signature,
+      dimensions: vectors[index]?.length || 0,
+      model: settings().embeddingModel,
+      updatedAt: now,
+      kind: entry.kind,
+      ...entry.meta,
+    },
+  }));
+
+  // The coarse per-floor vector is the centroid of every raw chunk vector. This preserves semantic
+  // coverage of the whole floor without another embedding request and lets high-floor retrieval scan
+  // one compact vector per floor before touching any detailed chunks.
+  const chunkVectors = valid
+    .map((entry, index) => entry.kind === 'raw-chunk' ? vectors[index] : null)
+    .filter(isVectorLike);
+  if (chunkVectors.length) {
+    const dimensions = Math.min(...chunkVectors.map(vector => vector.length));
+    const centroid = new Float32Array(dimensions);
+    for (const vector of chunkVectors) {
+      for (let i = 0; i < dimensions; i++) centroid[i] += Number(vector[i] || 0) / chunkVectors.length;
+    }
+    let norm = 0;
+    for (let i = 0; i < centroid.length; i++) norm += centroid[i] * centroid[i];
+    norm = Math.sqrt(norm) || 1;
+    for (let i = 0; i < centroid.length; i++) centroid[i] /= norm;
+    batch.push({
+      id: rawFloorVectorId(row),
+      trackRef: false,
+      record: {
+        vector: centroid,
+        signature,
+        dimensions,
+        model: settings().embeddingModel,
+        updatedAt: now,
+        kind: 'raw-floor',
+        messageKey: row.key,
+        floor: row.index,
+        assistantNumber: row.assistantNumber,
+        rawHash: row.rawHash,
+      },
+    });
+  }
+  const count = await putStoredVectorsBatch(data, batch);
+  data.processing.detailIndexUpdatedAt = Date.now();
+  if (options.save !== false) saveMemory();
+  return count;
+}
+
+async function indexRecallVectorsForRow(data, row, godlog = null, rawFallback = null) {
+  if (!embeddingConfigured() || !row?.key) return 0;
+  const valid = recallVectorEntriesForRow(row, godlog, rawFallback);
+  if (!valid.length) return 0;
+  const vectors = await embedTextsBatched(valid.map(entry => entry.text), 24);
+  return await persistRecallVectorsForRow(data, row, valid, vectors);
+}
+
+async function indexRecallVectorsForRowsBatch(data, rowSpecs = []) {
+  if (!embeddingConfigured()) return 0;
+  const prepared = (rowSpecs || []).map(spec => ({
+    ...spec,
+    entries: recallVectorEntriesForRow(spec.row, spec.godlog || null, spec.rawFallback || null),
+  })).filter(spec => spec.entries.length > 0);
+  if (!prepared.length) return 0;
+  const flat = prepared.flatMap(spec => spec.entries.map(entry => ({ spec, entry })));
+  const vectors = await embedTextsBatched(flat.map(item => item.entry.text), 24);
+  let cursor = 0;
+  let indexed = 0;
+  for (const spec of prepared) {
+    const rowVectors = vectors.slice(cursor, cursor + spec.entries.length);
+    cursor += spec.entries.length;
+    indexed += await persistRecallVectorsForRow(data, spec.row, spec.entries, rowVectors, { save: false });
+  }
+  saveMemory();
+  return indexed;
+}
+
+async function ensureRecallVectorsForRow(data, row, godlog = null, rawFallback = null) {
+  if (!embeddingConfigured() || !row?.key) return 0;
+  const signature = embeddingSignature();
+  const floorRecord = await getStoredVector(data, rawFloorVectorId(row));
+  const floorReady = floorRecord?.signature === signature && floorRecord?.rawHash === row.rawHash;
+  const canonicalId = godlog && isGodlogReady(godlog, row) ? godlog.id : rawFallback?.id;
+  const canonicalRef = canonicalId ? (data.vectorRefs?.[canonicalId] || data.vectors?.[canonicalId]) : null;
+  const canonicalReady = !canonicalId || canonicalRef?.signature === signature;
+  if (floorReady && canonicalReady) return 0;
+  return await indexRecallVectorsForRow(data, row, godlog, rawFallback);
+}
+
+async function vectorRecall(data, query, limit = recallCandidateLimit(), queryVectorOverride = null) {
   if (!embeddingConfigured()) return null;
-  const [queryVector] = await embedTexts([query]);
+  const queryVector = queryVectorOverride || (await embedTexts([query]))[0];
   const signature = embeddingSignature();
   const byId = new Map();
   // Use the exact same historical corpus as keyword recall. This lets a failed-summary floor
@@ -6102,14 +6686,14 @@ async function vectorRecall(data, query, limit = recallCandidateLimit()) {
     if (source?.item?.id) byId.set(source.item.id, source);
   }
 
-  const records = await listStoredVectors(data);
+  const records = await listStoredVectorsByKind(data, ['godlog', 'raw-recall']);
   if (state.vectorStorageUnavailable) throw new Error('向量 IndexedDB 不可用，改用关键词召回');
   const results = records
     .map(record => {
       const id = record.id || String(record.key || '').split(':').pop();
       if (record.signature !== signature) return null;
       const source = byId.get(id);
-      if (!source || !Array.isArray(record.vector)) return null;
+      if (!source || !isVectorLike(record.vector)) return null;
       return { ...source, score: cosine(queryVector, record.vector), method: 'embedding' };
     })
     .filter(Boolean)
@@ -6169,14 +6753,256 @@ function fuseHybridRecall(vectorHits = [], keywordHits = [], limit = recallCandi
     .slice(0, limit);
 }
 
+function rawChunkHitFromRecord(record, row, score = 0, method = 'embedding') {
+  if (!record || !row || record.rawHash !== row.rawHash) return null;
+  const source = String(row.turnText || row.text || '');
+  const start = Math.max(0, Number(record.start) || 0);
+  const end = Math.min(source.length, Math.max(start + 1, Number(record.end) || source.length));
+  const body = source.slice(start, end).trim();
+  if (!body) return null;
+  return {
+    kind: 'raw-chunk',
+    item: {
+      id: record.id,
+      key: row.key,
+      number: row.assistantNumber || 0,
+      assistantNumber: row.assistantNumber || 0,
+      floor: row.index,
+      chunkIndex: Number(record.chunkIndex || 0),
+      start,
+      end,
+      rawHash: row.rawHash,
+      body,
+      title: `原文细节 ${Number(record.chunkIndex || 0) + 1}`,
+    },
+    text: body,
+    score,
+    method,
+  };
+}
+
+async function rawFloorVectorRecall(data, queryVector, limit = RAW_DETAIL_CANDIDATE_FLOORS) {
+  if (!embeddingConfigured() || !isVectorLike(queryVector)) return [];
+  const signature = embeddingSignature();
+  const rows = chatRows(true).filter(row => row.role === 'assistant');
+  const recentKeys = new Set(rows.slice(-Math.max(1, Number(settings().keepRecent) || 3)).map(row => row.key));
+  const rowByKey = new Map(rows.map(row => [row.key, row]));
+  const records = await listStoredVectorsByKind(data, ['raw-floor']);
+  return (records || [])
+    .map(record => {
+      if (record.signature !== signature || !isVectorLike(record.vector)) return null;
+      const row = rowByKey.get(record.messageKey);
+      if (!row || recentKeys.has(row.key) || record.rawHash !== row.rawHash) return null;
+      return {
+        kind: 'raw-floor',
+        item: {
+          id: record.id,
+          key: row.key,
+          number: row.assistantNumber || 0,
+          assistantNumber: row.assistantNumber || 0,
+          floor: row.index,
+          rawHash: row.rawHash,
+          title: '原楼语义导航',
+          body: '',
+        },
+        score: cosine(queryVector, record.vector),
+        method: 'embedding',
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, Math.max(1, Number(limit) || RAW_DETAIL_CANDIDATE_FLOORS));
+}
+
+function expandDetailCandidateKeys(keys = [], rows = chatRows(true), radius = RAW_DETAIL_NEIGHBOR_RADIUS) {
+  const assistantRows = (rows || []).filter(row => row.role === 'assistant');
+  const indexByKey = new Map(assistantRows.map((row, index) => [row.key, index]));
+  const expanded = [];
+  const seen = new Set();
+  const add = key => {
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    expanded.push(key);
+  };
+  for (const key of keys || []) {
+    const at = indexByKey.get(key);
+    if (!Number.isInteger(at)) continue;
+    add(key);
+    for (let offset = 1; offset <= Math.max(0, Number(radius) || 0); offset++) {
+      add(assistantRows[at - offset]?.key);
+      add(assistantRows[at + offset]?.key);
+    }
+  }
+  return expanded;
+}
+
+function rawDetailKeywordScore(query, text) {
+  const terms = [...keywordSet(query, 180)];
+  if (!terms.length) return 0;
+  const own = keywordSet(text, 500);
+  let score = 0;
+  for (const term of terms) {
+    if (!own.has(term)) continue;
+    const latin = /^[a-z0-9_]+$/i.test(term);
+    score += latin ? Math.min(4.5, 1.2 + term.length * 0.18) : Math.min(5.5, 1.3 + term.length * 0.65);
+  }
+  const normalizedQuery = normalizeEntityMatchText(query);
+  const normalizedText = normalizeEntityMatchText(text);
+  if (normalizedQuery.length >= 4 && normalizedText.includes(normalizedQuery)) score += 8;
+  return score;
+}
+
+function detailKeywordRecallForKeys(candidateKeys, query, limit = recallCandidateLimit()) {
+  const rows = chatRows(true).filter(row => row.role === 'assistant');
+  const rowByKey = new Map(rows.map(row => [row.key, row]));
+  const results = [];
+  for (const key of [...new Set(candidateKeys || [])]) {
+    const row = rowByKey.get(key);
+    if (!row) continue;
+    for (const chunk of rawDetailChunksForRow(row)) {
+      const score = rawDetailKeywordScore(query, chunk.text);
+      if (score <= 0) continue;
+      results.push({
+        kind: 'raw-chunk',
+        item: {
+          id: chunk.id,
+          key: row.key,
+          number: row.assistantNumber || 0,
+          assistantNumber: row.assistantNumber || 0,
+          floor: row.index,
+          chunkIndex: chunk.index,
+          start: chunk.start,
+          end: chunk.end,
+          rawHash: row.rawHash,
+          body: chunk.text,
+          title: `原文细节 ${chunk.index + 1}`,
+        },
+        text: chunk.text,
+        score,
+        method: 'keyword',
+      });
+    }
+  }
+  return results
+    .sort((a, b) => b.score - a.score || Number(b.item?.floor ?? 0) - Number(a.item?.floor ?? 0))
+    .slice(0, Math.max(1, Number(limit) || recallCandidateLimit()));
+}
+
+async function detailVectorRecallForKeys(data, candidateKeys, queryVector, limit = recallCandidateLimit()) {
+  if (!embeddingConfigured() || !isVectorLike(queryVector) || !candidateKeys?.length) return [];
+  const signature = embeddingSignature();
+  const rows = chatRows(true).filter(row => row.role === 'assistant');
+  const rowByKey = new Map(rows.map(row => [row.key, row]));
+  const records = await listStoredVectorsForMessageKeys(data, candidateKeys, ['raw-chunk']);
+  return (records || [])
+    .map(record => {
+      if (record.signature !== signature || !isVectorLike(record.vector)) return null;
+      const row = rowByKey.get(record.messageKey);
+      if (!row) return null;
+      return rawChunkHitFromRecord(record, row, cosine(queryVector, record.vector), 'embedding');
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, Math.max(1, Number(limit) || recallCandidateLimit()));
+}
+
+function rawFloorLiteralCandidateKeys(query, rows = chatRows(true), limit = RAW_DETAIL_CANDIDATE_FLOORS) {
+  const assistantRows = (rows || []).filter(row => row.role === 'assistant');
+  if (!assistantRows.length) return [];
+  const recentKeys = new Set(assistantRows.slice(-Math.max(1, Number(settings().keepRecent) || 3)).map(row => row.key));
+  const terms = [...keywordSet(query, 140)]
+    .filter(term => /^[a-z0-9_]+$/i.test(term) ? term.length >= 3 : term.length >= 2)
+    .sort((a, b) => b.length - a.length)
+    .slice(0, 28);
+  if (!terms.length) return [];
+  const hits = [];
+  for (const row of assistantRows) {
+    if (!row?.key || recentKeys.has(row.key)) continue;
+    const source = String(row.turnText || row.text || '').toLocaleLowerCase();
+    if (!source) continue;
+    let score = 0;
+    let matches = 0;
+    for (const term of terms) {
+      if (!source.includes(term)) continue;
+      matches++;
+      const latin = /^[a-z0-9_]+$/i.test(term);
+      score += latin ? Math.min(7, 1.5 + term.length * 0.3) : Math.min(9, 1.4 + term.length * 1.05);
+    }
+    if (matches) hits.push({ key: row.key, score, floor: Number(row.index ?? -1), matches });
+  }
+  return hits
+    .sort((a, b) => b.score - a.score || b.matches - a.matches || b.floor - a.floor)
+    .slice(0, Math.max(1, Number(limit) || RAW_DETAIL_CANDIDATE_FLOORS))
+    .map(hit => hit.key);
+}
+
+function keywordHierarchicalRecall(data, recallQuery, limit = recallCandidateLimit()) {
+  const keywordQuery = recallQuery?.keywordQuery || recallQuery?.query || '';
+  const coarse = keywordRecall(data, keywordQuery, limit).map(hit => ({ ...hit, method: 'keyword' }));
+  const candidateKeys = coarse.slice(0, RAW_DETAIL_CANDIDATE_FLOORS).map(hit => hit.item?.key).filter(Boolean);
+  candidateKeys.push(...rawFloorLiteralCandidateKeys(recallQuery?.lastUser || keywordQuery, chatRows(true), RAW_DETAIL_CANDIDATE_FLOORS));
+  candidateKeys.push(...itemEventCandidateKeys(data, keywordQuery, RAW_DETAIL_CANDIDATE_FLOORS));
+  const expandedKeys = expandDetailCandidateKeys(candidateKeys, chatRows(true), RAW_DETAIL_NEIGHBOR_RADIUS)
+    .slice(0, RAW_DETAIL_CANDIDATE_FLOORS * (RAW_DETAIL_NEIGHBOR_RADIUS * 2 + 1));
+  const detail = detailKeywordRecallForKeys(expandedKeys, keywordQuery, limit);
+  const detailKeys = new Set(detail.map(hit => hit.item?.key).filter(Boolean));
+  return [...detail, ...coarse.filter(hit => !detailKeys.has(hit.item?.key))]
+    .sort((a, b) => Number(b.score || 0) - Number(a.score || 0))
+    .slice(0, Math.max(limit, recallMaxCount() * 3));
+}
+
 async function hybridRecall(data, recallQuery, limit = recallCandidateLimit()) {
   const keywordQuery = recallQuery?.keywordQuery || recallQuery?.query || '';
   const semanticQuery = recallQuery?.semanticQuery || recallQuery?.query || '';
   const keywordHits = keywordRecall(data, keywordQuery, limit)
     .map(hit => ({ ...hit, method: 'keyword' }));
-  if (!embeddingConfigured()) return keywordHits;
-  const vectorHits = await vectorRecall(data, semanticQuery, limit) || [];
-  return fuseHybridRecall(vectorHits, keywordHits, limit);
+
+  let queryVector = null;
+  let vectorHits = [];
+  let rawFloorHits = [];
+  if (embeddingConfigured()) {
+    [queryVector] = await embedTexts([semanticQuery]);
+    vectorHits = await vectorRecall(data, semanticQuery, limit, queryVector) || [];
+    rawFloorHits = await rawFloorVectorRecall(data, queryVector, RAW_DETAIL_CANDIDATE_FLOORS);
+  }
+  const coarse = embeddingConfigured()
+    ? fuseHybridRecall(vectorHits, keywordHits, limit)
+    : keywordHits;
+
+  // Candidate floors come from three independent navigation signals:
+  // 1) Godlog/keyword coarse hits, 2) one centroid vector per raw floor, 3) explicit item event chains.
+  // Only these floors (plus immediate neighbours for continuity) are opened for detailed raw chunks.
+  const candidateKeys = [];
+  for (const hit of coarse.slice(0, RAW_DETAIL_CANDIDATE_FLOORS)) if (hit.item?.key) candidateKeys.push(hit.item.key);
+  for (const hit of rawFloorHits) if (hit.item?.key) candidateKeys.push(hit.item.key);
+  candidateKeys.push(...rawFloorLiteralCandidateKeys(recallQuery?.lastUser || keywordQuery, chatRows(true), RAW_DETAIL_CANDIDATE_FLOORS));
+  candidateKeys.push(...itemEventCandidateKeys(data, keywordQuery, RAW_DETAIL_CANDIDATE_FLOORS));
+  const expandedKeys = expandDetailCandidateKeys(candidateKeys, chatRows(true), RAW_DETAIL_NEIGHBOR_RADIUS)
+    .slice(0, RAW_DETAIL_CANDIDATE_FLOORS * (RAW_DETAIL_NEIGHBOR_RADIUS * 2 + 1));
+
+  const detailKeywordHits = detailKeywordRecallForKeys(expandedKeys, keywordQuery, limit);
+  const detailVectorHits = queryVector
+    ? await detailVectorRecallForKeys(data, expandedKeys, queryVector, limit)
+    : [];
+  const detailHits = queryVector
+    ? fuseHybridRecall(detailVectorHits, detailKeywordHits, limit)
+    : detailKeywordHits;
+
+  const detailKeys = new Set(detailHits.map(hit => hit.item?.key).filter(Boolean));
+  const combined = [
+    ...detailHits.map(hit => ({ ...hit, score: Math.min(1.15, Number(hit.score || 0) * 1.06) })),
+    ...coarse.filter(hit => !detailKeys.has(hit.item?.key)),
+  ];
+  const seen = new Set();
+  return combined
+    .filter(hit => {
+      const id = recallIdentity(hit);
+      if (!id || seen.has(id)) return false;
+      seen.add(id);
+      return true;
+    })
+    .sort((a, b) => Number(b.score || 0) - Number(a.score || 0))
+    .slice(0, Math.max(limit, recallMaxCount() * 3));
 }
 
 function taggedNarrativeContent(text) {
@@ -6311,8 +7137,7 @@ async function prepareDynamicRecall(chat = getContext().chat || []) {
     lateForCurrentPrompt: false,
   };
   if (!embeddingConfigured()) {
-    const result = keywordRecall(memoryData(), recallQuery.keywordQuery || recallQuery.query, recallCandidateLimit())
-      .map(hit => ({ ...hit, method: 'keyword' }));
+    const result = keywordHierarchicalRecall(memoryData(), recallQuery, recallCandidateLimit());
     state.recallPrefetchResult = result;
     state.recallPrefetchPromise = null;
     state.recallPrefetchStatus = {
@@ -6344,8 +7169,7 @@ async function prepareDynamicRecall(chat = getContext().chat || []) {
     })
     .catch(err => {
       console.warn('[AnchorMemory] hybrid recall semantic channel failed; prompt will use keyword results', err);
-      const fallback = keywordRecall(memoryData(), recallQuery.keywordQuery || recallQuery.query, recallCandidateLimit())
-        .map(hit => ({ ...hit, method: 'keyword' }));
+      const fallback = keywordHierarchicalRecall(memoryData(), recallQuery, recallCandidateLimit());
       if (state.recallPrefetchKey === key) {
         state.recallPrefetchResult = fallback;
         state.recallPrefetchStatus = {
@@ -6485,8 +7309,7 @@ function dynamicRecall(data, chat, rows = chatRows(true), options = {}) {
       ? state.recallPrefetchResult
       : null);
   if (!recalled || recalled.length === 0) {
-    recalled = keywordRecall(data, recallQuery.keywordQuery || recallQuery.query, recallCandidateLimit())
-      .map(hit => ({ ...hit, method: 'keyword' }));
+    recalled = keywordHierarchicalRecall(data, recallQuery, recallCandidateLimit());
     if (resolvedRecall?.timedOut) queryState.mode = 'keyword-fallback-timeout';
     else if (resolvedRecall && Array.isArray(resolvedRecall.results)) queryState.mode = 'keyword-fallback-no-hybrid-hit';
     else if (state.recallPrefetchKey === key && state.recallPrefetchPromise) queryState.mode = 'keyword-fallback-while-hybrid-prefetching';
@@ -6503,7 +7326,7 @@ function dynamicRecall(data, chat, rows = chatRows(true), options = {}) {
     ? options.recentFactsMeta
     : (state.lastRecentFactsMeta || []);
   const deterministicIds = new Set(deterministicRefs.map(ref => ref.id).filter(Boolean));
-  recalled = recalled.filter(hit => ['godlog', 'raw-recall'].includes(hit.kind)
+  recalled = recalled.filter(hit => ['godlog', 'raw-recall', 'raw-chunk'].includes(hit.kind)
     && !deterministicIds.has(hit.item?.id)
     && !recentRawKeys.has(hit.item?.key));
 
@@ -6523,7 +7346,7 @@ function dynamicRecall(data, chat, rows = chatRows(true), options = {}) {
     floor: hit.item.floor ?? null,
     kind: hit.kind,
     key: hit.item.key || '',
-    title: hit.kind === 'godlog' ? godlogFieldValue(hit.item.body || '', 'Title') : (hit.item.title || '原楼正文保底'),
+    title: hit.kind === 'godlog' ? godlogFieldValue(hit.item.body || '', 'Title') : (hit.item.title || (hit.kind === 'raw-chunk' ? '原文细节' : '原楼正文保底')),
     method: hit.method || 'keyword',
     score: Number(hit.score || 0),
     semanticScore: Number(hit.semanticScore || 0),
@@ -6543,14 +7366,31 @@ function dynamicRecall(data, chat, rows = chatRows(true), options = {}) {
   if (!recalled.length) return '';
 
   const parts = ['### 动态召回（与当前输入相关的旧楼细节）'];
+  const renderBudget = Math.min(recallTokenBudget(), DYNAMIC_RECALL_DETAIL_TOKEN_BUDGET);
+  let renderedTokens = estimateTokens(parts[0]);
   for (const hit of recalled) {
     const assistantNumber = Number(hit.item?.assistantNumber || hit.item?.number || 0);
     const floorLabel = assistantNumber > 0 ? `第 ${assistantNumber} 个AI回合` : '旧AI回合';
-    const title = hit.kind === 'godlog' ? godlogFieldValue(hit.item.body || '', 'Title') : '原楼正文保底';
-    parts.push(`#### ${floorLabel}${title ? `｜${title}` : ''}`);
-    parts.push(safePromptMemoryText(hit.kind, hit.item, hit.kind === 'godlog' ? 1200 : 1400));
+    const title = hit.kind === 'godlog'
+      ? godlogFieldValue(hit.item.body || '', 'Title')
+      : (hit.item?.title || (hit.kind === 'raw-chunk' ? '原文细节' : '原楼正文保底'));
+    const body = safePromptMemoryText(hit.kind, hit.item, hit.kind === 'godlog' ? 900 : (hit.kind === 'raw-chunk' ? 900 : 1100));
+    const block = `#### ${floorLabel}${title ? `｜${title}` : ''}\n\n${body}`;
+    const blockTokens = estimateTokens(block);
+    if (renderedTokens + blockTokens > renderBudget) {
+      const remaining = renderBudget - renderedTokens;
+      if (remaining >= 180) {
+        const clipped = clampTextByTokens(block, remaining, 0.72, '…（本条原文细节因本次召回预算截短）…');
+        if (clipped) parts.push(clipped);
+      }
+      break;
+    }
+    parts.push(block);
+    renderedTokens += blockTokens;
   }
-  return clampTextHeadTail(parts.join('\n\n'), DYNAMIC_RECALL_MEMORY_CHAR_BUDGET, 0.25);
+  const rendered = parts.join('\n\n');
+  if (commit && state.lastRecallQuery?.key === key) state.lastRecallQuery.renderedTokens = estimateTokens(rendered);
+  return rendered;
 }
 
 function hasCoreInjectionContent(data) {
@@ -7155,6 +7995,8 @@ function forgetGodlogItem(data, item, reason = '源楼层已变动', includeUser
   removeGodlogBlockFromMessage(currentRowForGodlog(item, includeUser));
   markAnchorsStaleByKey(data, item.key, reason);
   removeStoredVector(data, item.id);
+  deleteStoredVectorsForMessage(data, item.key, ['raw-floor', 'raw-chunk'])
+    .catch(err => console.warn('[AnchorMemory] orphan raw-detail vector cleanup failed', err));
   delete data.processing?.codexKeys?.[item.key];
   delete data.messageGodlogs?.[item.key];
   delete data.messageRecalls?.[item.key];
@@ -7256,6 +8098,8 @@ function remapGodlogSourceKey(data, item, nextKey) {
   if (table.lastGoodKey === oldKey) table.lastGoodKey = targetKey;
   data.relationshipTable = table;
   data.codex.relationship = relationshipTableMarkdown(table, false);
+  deleteStoredVectorsForMessage(data, oldKey, ['raw-floor', 'raw-chunk'])
+    .catch(err => console.warn('[AnchorMemory] remapped raw-detail vector cleanup failed', err));
   item.key = targetKey;
   if (state.selectedRecallMessageKey === oldKey) state.selectedRecallMessageKey = targetKey;
   state.godlogIndexData = null;
@@ -7877,7 +8721,8 @@ async function generateGodlogForRowUnlocked(row, force = false) {
     refreshTimelineFromGodlogs(data);
     await updateCodexFromGodlog(data, row, existing);
     if (!isSameChatContext(contextToken)) return false;
-    await ensureMemoryItemEmbedded(data, existing.id, safeGodlogMemoryText(existing.body || ''));
+    refreshItemEventTimeline(data, { row });
+    await ensureRecallVectorsForRow(data, row, existing, null);
     return true;
   }
   if (!force && existing?.status === 'failed') {
@@ -8039,10 +8884,11 @@ async function generateGodlogForRowUnlocked(row, force = false) {
     if (!isSameChatContext(contextToken)) return false;
     await updateCodexFromGodlog(data, latestRow, item);
     if (!isSameChatContext(contextToken)) return false;
+    refreshItemEventTimeline(data, { row: latestRow });
     // If this floor previously relied on raw-recall, retire that fallback vector now that the
     // canonical Godlog exists.
     removeStoredVector(data, rawRecallItem(latestRow).id);
-    await embedMemoryItem(data, item.id, safeGodlogMemoryText(item.body || ''));
+    await ensureRecallVectorsForRow(data, latestRow, item, null);
     saveMemory(true);
     if (force && existing) queueMemoryJob('逐楼摘要已手动重跑', 120);
     return true;
@@ -8087,7 +8933,8 @@ async function generateGodlogForRowUnlocked(row, force = false) {
       scheduleGodlogAutoRetry(row, force, retryCount, err);
     } else {
       const raw = rawRecallItem(row);
-      if (raw.body) embedMemoryItem(data, raw.id, raw.body).catch(embedErr => console.warn('[AnchorMemory] raw fallback embedding failed', embedErr));
+      refreshItemEventTimeline(data, { row });
+      if (raw.body) ensureRecallVectorsForRow(data, row, null, raw).catch(embedErr => console.warn('[AnchorMemory] raw detail fallback embedding failed', embedErr));
     }
     return false;
   } finally {
@@ -8558,7 +9405,7 @@ async function createAnchorUnlocked(force = false, customMaterials = null, inter
 
   try {
     const number = data.processing.anchorCount + 1;
-    const body = normalizeAnchorBody(await callWriter(buildAnchorPrompt(data, materials), 4200), number);
+    const body = normalizeAnchorBody(await callDerivedWriter(buildAnchorPrompt(data, materials), 4200, '分段锚点'), number);
     if (!isSameChatContext(contextToken)) return false;
     if (!body || body.trim().length < 60) throw new Error('锚点内容为空或过短');
     const rows = materials.map(item => item.row);
@@ -8706,7 +9553,7 @@ async function maybeMergeUnlocked(force = false, intervalOverride = null) {
     : `正在更新累计历史：${anchorCount} 个分段锚点`);
   try {
     const mergeNumber = data.processing.mergeCount + 1;
-    const body = normalizeMergeBody(await callWriter(buildMergePrompt(data, plan, force), 6200), mergeNumber);
+    const body = normalizeMergeBody(await callDerivedWriter(buildMergePrompt(data, plan, force), 6200, '累计历史'), mergeNumber);
     if (!isSameChatContext(contextToken)) return false;
     if (!body || body.trim().length < 120) throw new Error('合并内容为空或过短');
 
@@ -10218,7 +11065,8 @@ function renderHealth() {
     const signature = embeddingConfigured() ? embeddingSignature() : '';
     const actual = Object.entries(data.vectorRefs || {})
       .filter(([id, record]) => validVectorIds.has(id) && record.signature === signature).length;
-    if (actual < expected) issues.push(`当前模型的向量索引不完整：${actual}/${expected}，建议点“重建向量”。`);
+    if (actual < expected) issues.push(`当前模型的逐楼摘要向量索引不完整：${actual}/${expected}，建议点“重建向量”。`);
+    if (data.processing?.detailIndexNeedsRebuild) issues.push('本聊天来自旧版索引，尚未建立 1.1.0 原文细节向量。请点一次“重建向量”，之后新楼会增量维护，不会每轮重建全部历史。');
   }
   const liveKeys = new Set(chatRows(true).map(row => row.key));
   const orphanKeys = Object.keys(data.processing.anchoredKeys || {}).filter(key => !liveKeys.has(key));
@@ -10900,11 +11748,38 @@ async function rebuildVectors() {
   }
   await clearStoredVectors(data);
   saveMemory();
-  showStatus('正在重建向量...');
-  for (const source of recallCorpus(data)) {
-    if (source?.item?.id && source.text) await embedMemoryItem(data, source.item.id, source.text);
+  const rows = chatRows(true).filter(row => row.role === 'assistant');
+  showStatus(`正在重建分层向量：0/${rows.length}`);
+  let indexed = 0;
+  const groupSize = 12;
+  for (let offset = 0; offset < rows.length; offset += groupSize) {
+    const groupRows = rows.slice(offset, offset + groupSize);
+    const specs = groupRows.map(row => {
+      const godlog = godlogForRow(data, row);
+      const readyGodlog = isGodlogReady(godlog, row) ? godlog : null;
+      return { row, godlog: readyGodlog, rawFallback: readyGodlog ? null : rawRecallItem(row) };
+    });
+    try {
+      // Cross-floor batching turns hundreds/thousands of one-floor HTTP requests into compact
+      // embedding batches while preserving per-floor IDB pointers and centroids.
+      indexed += await indexRecallVectorsForRowsBatch(data, specs);
+    } catch (batchErr) {
+      console.warn('[AnchorMemory] vector rebuild batch failed; retrying rows individually', batchErr);
+      // Provider batch-size quirks should not make the whole rebuild unusable. Retry this group row by row.
+      for (const spec of specs) {
+        try {
+          indexed += await indexRecallVectorsForRow(data, spec.row, spec.godlog, spec.rawFallback);
+        } catch (err) {
+          console.warn('[AnchorMemory] vector rebuild row failed', spec.row.index, err);
+        }
+      }
+    }
+    showStatus(`正在重建分层向量：${Math.min(rows.length, offset + groupRows.length)}/${rows.length}`);
   }
-  toastr?.success?.('向量重建完成：仅索引可被动态召回的逐楼摘要与原文保底', 'Anchor Memory');
+  data.processing.detailIndexNeedsRebuild = false;
+  data.processing.detailIndexUpdatedAt = Date.now();
+  saveMemory(true);
+  toastr?.success?.(`向量重建完成：已建立逐楼导航 + 原文细节索引（${indexed} 条本地向量记录）`, 'Anchor Memory');
   updatePreview();
 }
 
@@ -12468,6 +13343,7 @@ function onChatChanged() {
   state.lastInjectionRefs = [];
   state.pendingInjectionContent = '';
   state.vectorCache.clear();
+  state.vectorKindCache.clear();
   clearRecallPrefetch();
   setExtensionPrompt(CORE_PROMPT_KEY, '', extension_prompt_types.IN_CHAT, 0);
   setExtensionPrompt(RECALL_PROMPT_KEY, '', extension_prompt_types.IN_PROMPT, 0);

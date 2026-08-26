@@ -18,7 +18,10 @@ function stableId(prefix, value) {
 
 export function buildItemLedger(rows = [], previous = {}, tombstones = {}) {
   const byKey = { ...(previous?.byKey || {}) };
-  const order = [];
+  // Preserve previously confirmed entities unless the user explicitly tombstoned them. LLM table
+  // rewrites are allowed to update an item, but a one-off omission must not silently erase its
+  // historical event chain or make later references impossible to resolve.
+  const order = (previous?.order || []).filter(key => byKey[key] && !tombstones?.[key]);
   for (const row of rows || []) {
     const name = clean(row.name || row['物品/细节/内部梗'] || row['物品'] || row['名称']);
     const key = entityKey(name);
@@ -39,7 +42,7 @@ export function buildItemLedger(rows = [], previous = {}, tombstones = {}) {
 
 export function buildSceneLedger(rows = [], previous = {}, tombstones = {}) {
   const byKey = { ...(previous?.byKey || {}) };
-  const order = [];
+  const order = (previous?.order || []).filter(key => byKey[key] && !tombstones?.[key]);
   for (const row of rows || []) {
     const name = clean(row.name || row['场景/地点'] || row['场景'] || row['地点']);
     const key = entityKey(name);
