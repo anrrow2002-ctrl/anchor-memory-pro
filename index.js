@@ -40,6 +40,7 @@ import {
   normalizeOpenAiCompatibleBaseUrl,
   openAiCompatibleProviderInfo,
   providerCompatibilityHint,
+  assessOutputLimitResult,
 } from './core/provider-compat.js';
 
 /**
@@ -156,7 +157,7 @@ function isGenerationActive() {
 
 
 const MODULE = 'anchor_memory';
-const EXTENSION_VERSION = '1.1.0';
+const EXTENSION_VERSION = '1.1.1';
 const DATA_KEY = 'anchorMemory';
 const CORE_PROMPT_KEY = 'anchor_memory_core';
 const RECALL_PROMPT_KEY = 'anchor_memory_recall';
@@ -4318,34 +4319,51 @@ async function callSecondary(messages, maxTokens = 2400, options = {}) {
     return { content, finishReason };
   };
 
-  const truncatedReasons = new Set(['length', 'max_tokens', 'max_output_tokens', 'token_limit']);
+  const completionAssessment = result => {
+    const assessment = assessOutputLimitResult(result.finishReason, result.content, options.isContentComplete);
+    if (assessment.validatorError) {
+      console.warn('[AnchorMemory] secondary completion validator failed; treating result as incomplete', assessment.validatorError);
+    }
+    return assessment;
+  };
+
   let result = await requestOnce(messages, maxTokens);
-  if (truncatedReasons.has(result.finishReason)) {
+  let assessment = completionAssessment(result);
+  if (assessment.hitOutputLimit && assessment.contentComplete) {
+    console.warn(`[AnchorMemory] ${taskLabel}: provider reported finish_reason=${result.finishReason}, but the task-specific completeness check passed; accepting the complete body without retry.`);
+    return result.content;
+  }
+  if (assessment.shouldRetry) {
     const retryBudget = Math.min(12000, Math.max(maxTokens + 1200, Math.ceil(maxTokens * 1.5)));
     const retryMessages = messages.map((message, index) => (
       index === 0 && message?.role === 'system'
         ? {
             ...message,
             content: `${message.content}
-The previous attempt was cut off by the output-token limit. Regenerate the complete result from the beginning, keep every required field/section, and compress wording enough to finish within the budget.`,
+The previous attempt was cut off by the output-token limit and did not pass the task completeness check. Regenerate the complete result from the beginning, keep every required field/section, and compress wording enough to finish within the budget.`,
           }
         : message
     ));
     result = await requestOnce(retryMessages, retryBudget);
-    if (truncatedReasons.has(result.finishReason)) {
-      throw new Error(`副API连续两次因输出上限被截断（${maxTokens} → ${retryBudget} tokens）；本次结果未保存，将保留任务等待重跑`);
+    assessment = completionAssessment(result);
+    if (assessment.hitOutputLimit && assessment.contentComplete) {
+      console.warn(`[AnchorMemory] ${taskLabel}: retry still reported finish_reason=${result.finishReason}, but the task-specific completeness check passed; accepting the complete body.`);
+      return result.content;
+    }
+    if (assessment.shouldRetry) {
+      throw new Error(`副API连续两次触发输出上限，且内容完整性校验未通过（${maxTokens} → ${retryBudget} tokens）；本次结果未保存，将保留任务等待重跑`);
     }
   }
   return result.content;
 }
 
-async function callWriter(prompt, maxTokens = 3200) {
+async function callWriter(prompt, maxTokens = 3200, options = {}) {
   const s = settings();
   if (secondaryConfigured(s)) {
     return callSecondary([
       { role: 'system', content: 'You are a precise narrative memory archivist. Output only the requested Markdown.' },
       { role: 'user', content: prompt },
-    ], maxTokens);
+    ], maxTokens, options);
   }
   throw new Error('锚点/合并后台整理需要先配置并启用副API；为避免把记忆整理提示词发送给主模型，本版本不再使用主模型静默整理。');
 }
@@ -4357,17 +4375,18 @@ function hasDerivedMemoryEndSentinel(text) {
 async function callDerivedWriter(prompt, maxTokens = 3200, label = '记忆整理') {
   const sentinelInstruction = '\n\n完整性校验：最终输出的最后一行必须严格写 <AnchorMemoryEnd/>。这只是后台完整性标记，不属于剧情内容。';
   const fullPrompt = `${prompt}${sentinelInstruction}`;
-  let raw = await callWriter(fullPrompt, maxTokens);
+  const writerOptions = { taskLabel: label, isContentComplete: hasDerivedMemoryEndSentinel };
+  let raw = await callWriter(fullPrompt, maxTokens, writerOptions);
   if (hasDerivedMemoryEndSentinel(raw)) return raw;
   // Some OpenAI-compatible providers incorrectly report finish_reason=stop for a truncated body.
   // Retry once with a larger ceiling and an explicit warning instead of persisting a half-written anchor.
   const retryBudget = Math.min(12000, Math.max(Number(maxTokens) + 1600, Math.ceil(Number(maxTokens) * 1.55)));
-  raw = await callWriter(`${fullPrompt}\n\n上一次输出缺少完整性标记，疑似被接口静默截断。请从头完整重写，绝不能省略末尾标记。`, retryBudget);
+  raw = await callWriter(`${fullPrompt}\n\n上一次输出缺少完整性标记，疑似被接口静默截断。请从头完整重写，绝不能省略末尾标记。`, retryBudget, writerOptions);
   if (!hasDerivedMemoryEndSentinel(raw)) throw new Error(`${label}输出缺少完整性标记，疑似被接口截断；已拒绝保存不完整结果`);
   return raw;
 }
 
-async function callSummaryWriter(prompt, maxTokens = 1000) {
+async function callSummaryWriter(prompt, maxTokens = 1000, options = {}) {
   const s = settings();
   if (!secondaryConfigured(s)) {
     throw new Error('逐楼摘要需要先配置并启用副API');
@@ -4375,7 +4394,7 @@ async function callSummaryWriter(prompt, maxTokens = 1000) {
   return callSecondary([
     { role: 'system', content: 'You are a precise Godlog narrative summarizer. Return only the requested XML fields for the background task. Never use Markdown code fences and never write content intended for the visible chat reply.' },
     { role: 'user', content: prompt },
-  ], maxTokens);
+  ], maxTokens, options);
 }
 
 function buildGodlogPrompt(data, row, item = null) {
@@ -8770,7 +8789,10 @@ async function generateGodlogForRowUnlocked(row, force = false) {
     if (item.pendingGeneratedBody && item.pendingGeneratedRawHash === sourceHash) {
       body = normalizeGodlogBlock(item.pendingGeneratedBody);
     } else {
-      body = normalizeGodlogBlock(await callSummaryWriter(basePrompt, 1200));
+      body = normalizeGodlogBlock(await callSummaryWriter(basePrompt, 1200, {
+        taskLabel: `第 ${row.index} 楼逐楼摘要`,
+        isContentComplete: content => validateGodlogCandidate(normalizeGodlogBlock(content), row).ok,
+      }));
       if (!isSameChatContext(contextToken)) return false;
     }
     body = replaceGodlogField(body, 'Nub', String(item.number || godlogNumberForRow(row) || 1));
@@ -8781,7 +8803,10 @@ async function generateGodlogForRowUnlocked(row, force = false) {
       // cause and must not be disguised as a second “summary correction” request.
       if (!String(body || '').trim()) throw new Error(`摘要校验失败：${validation.reason}`);
       const correctionPrompt = buildGodlogCorrectionPrompt(basePrompt, body, validation);
-      body = normalizeGodlogBlock(await callSummaryWriter(correctionPrompt, 1800));
+      body = normalizeGodlogBlock(await callSummaryWriter(correctionPrompt, 1800, {
+        taskLabel: `第 ${row.index} 楼逐楼摘要纠错`,
+        isContentComplete: content => validateGodlogCandidate(normalizeGodlogBlock(content), row).ok,
+      }));
       if (!isSameChatContext(contextToken)) return false;
       body = replaceGodlogField(body, 'Nub', String(item.number || godlogNumberForRow(row) || 1));
       validation = validateGodlogCandidate(body, row);

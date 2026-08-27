@@ -204,3 +204,37 @@ export function providerCompatibilityHint(url) {
 export const OPENAI_COMPATIBLE_PROVIDER_PROFILES = Object.freeze(
   PROVIDERS.map(profile => Object.freeze({ ...profile })),
 );
+
+/**
+ * Interpret provider finish reasons conservatively without throwing away a body
+ * that already satisfies the caller's task-specific completeness contract.
+ *
+ * Several OpenAI-compatible gateways report `length` whenever the generation
+ * counter touches the ceiling, even when the requested XML/Markdown payload has
+ * already closed cleanly. The finish reason is therefore an auxiliary signal;
+ * the task-specific validator is authoritative for whether a retry is needed.
+ */
+export function assessOutputLimitResult(finishReason, content, isContentComplete = null) {
+  const reason = String(finishReason || '').toLowerCase();
+  const outputLimitReasons = new Set(['length', 'max_tokens', 'max_output_tokens', 'token_limit']);
+  const hitOutputLimit = outputLimitReasons.has(reason);
+  let contentComplete = false;
+  let validatorError = null;
+
+  if (hitOutputLimit && typeof isContentComplete === 'function') {
+    try {
+      contentComplete = !!isContentComplete(String(content || ''));
+    } catch (err) {
+      validatorError = err;
+      contentComplete = false;
+    }
+  }
+
+  return {
+    reason,
+    hitOutputLimit,
+    contentComplete,
+    shouldRetry: hitOutputLimit && !contentComplete,
+    validatorError,
+  };
+}
