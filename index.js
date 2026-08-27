@@ -157,11 +157,11 @@ function isGenerationActive() {
 
 
 const MODULE = 'anchor_memory';
-const EXTENSION_VERSION = '1.1.1';
+const EXTENSION_VERSION = '1.1.2';
 const DATA_KEY = 'anchorMemory';
 const CORE_PROMPT_KEY = 'anchor_memory_core';
 const RECALL_PROMPT_KEY = 'anchor_memory_recall';
-const DATA_VERSION = 14;
+const DATA_VERSION = 15;
 const RELATIONSHIP_SCHEMA_VERSION = 2;
 const RELATIONSHIP_CHECKPOINT_INTERVAL = 10;
 const VECTOR_DB_NAME = 'anchor-memory-vectors';
@@ -823,6 +823,7 @@ function defaultData() {
       queueSources: [],
       pendingPromptInjection: null,
       lastError: '',
+      lastPostprocessError: '',
     },
   };
 }
@@ -1509,6 +1510,51 @@ function memoryData() {
   if (priorDataVersion > 0 && priorDataVersion < 14 && chatRows(true).some(row => row.role === 'assistant')) {
     data.processing.detailIndexNeedsRebuild = true;
     migrationTouched = true;
+  }
+
+  // v1.1.2: repair the infinite-rerun state created by v1.1.0/v1.1.1. Those builds kept
+  // post-processing (hide/codex/vector indexing) inside the summary writer transaction. A valid
+  // Godlog could therefore be committed, then demoted back to pending when a later indexing step
+  // failed. Restore any structurally complete stored body as a durable ready snapshot; post-process
+  // work is rebuilt independently and must never spend another summary API request.
+  if (priorDataVersion > 0 && priorDataVersion < 15) {
+    const rowsByKey = new Map(chatRows(true).filter(row => row.role === 'assistant').map(row => [row.key, row]));
+    for (const item of data.godlogs || []) {
+      if (!item || item.archived || item.status === 'orphaned' || !String(item.body || '').trim()) continue;
+      const row = rowsByKey.get(item.key) || null;
+      const validation = validateGodlogCandidate(item.body, row);
+      if (!validation.ok) continue;
+      const oldHash = String(item.rawHash || '');
+      Object.assign(item, {
+        body: validation.block,
+        status: 'ready',
+        stale: false,
+        staleSince: 0,
+        error: '',
+        retryCount: 0,
+        retryScheduledAt: 0,
+        rerunPending: false,
+        rerunQueued: false,
+        rerunRetryCount: 0,
+        rerunError: '',
+        summaryStartedAt: 0,
+        pendingGeneratedBody: '',
+        pendingGeneratedRawHash: '',
+        sourceLookupDeferredAt: 0,
+        updatedAt: Number(item.updatedAt) || Date.now(),
+      });
+      if (row && oldHash && oldHash !== row.rawHash) {
+        item.sourceMismatch = true;
+        item.sourceMismatchReason = '升级时检测到摘要对应的历史正文版本与当前正文不同；保留已完成摘要，不自动重写。';
+        item.sourceMismatchAt = Date.now();
+      } else {
+        item.sourceMismatch = false;
+        item.sourceMismatchReason = '';
+        item.sourceMismatchAt = 0;
+      }
+      migrationTouched = true;
+    }
+    data.processing.lastPostprocessError = '';
   }
   if (data.processing.pendingPromptInjection?.content) {
     const content = String(data.processing.pendingPromptInjection.content || '');
@@ -8699,6 +8745,42 @@ function syncLatestGodlogPositionFields(data) {
   return true;
 }
 
+async function runGodlogPostCommitTasks(data, row, item, contextToken) {
+  const errors = [];
+  const runStep = async (label, fn) => {
+    if (!isSameChatContext(contextToken)) return false;
+    try {
+      await fn();
+      return true;
+    } catch (err) {
+      const message = String(err?.message || err || '未知错误');
+      errors.push(`${label}: ${message}`);
+      console.warn(`[AnchorMemory] Godlog已提交；${label}失败，不会重跑摘要:`, err);
+      return false;
+    }
+  };
+
+  await runStep('隐藏状态同步', () => enforceAnchorHiddenState(data));
+  await runStep('人物/Codex后处理', () => updateCodexFromGodlog(data, row, item));
+  await runStep('实体事件链更新', async () => { refreshItemEventTimeline(data, { row }); });
+  await runStep('原文细节向量索引', async () => {
+    // The canonical Godlog is already durable. Vector indexing is a rebuildable cache only.
+    // Any embedding/IndexedDB failure must stay in the vector subsystem and never demote Godlog.
+    removeStoredVector(data, rawRecallItem(row).id);
+    await ensureRecallVectorsForRow(data, row, item, null);
+  });
+
+  if (!isSameChatContext(contextToken)) return { ok: false, contextChanged: true, errors };
+  if (errors.length) {
+    data.processing.lastPostprocessError = errors.join('；');
+    if (errors.some(text => text.startsWith('原文细节向量索引:'))) data.processing.detailIndexNeedsRebuild = true;
+  } else {
+    data.processing.lastPostprocessError = '';
+  }
+  saveMemory(true);
+  return { ok: errors.length === 0, contextChanged: false, errors };
+}
+
 async function generateGodlogForRow(row, force = false) {
   const key = summaryRowKey(row);
   if (!key) return false;
@@ -8738,11 +8820,8 @@ async function generateGodlogForRowUnlocked(row, force = false) {
     }
     syncGodlogBlockToMessage(row, existing.body);
     refreshTimelineFromGodlogs(data);
-    await updateCodexFromGodlog(data, row, existing);
-    if (!isSameChatContext(contextToken)) return false;
-    refreshItemEventTimeline(data, { row });
-    await ensureRecallVectorsForRow(data, row, existing, null);
-    return true;
+    await runGodlogPostCommitTasks(data, row, existing, contextToken);
+    return isSameChatContext(contextToken);
   }
   if (!force && existing?.status === 'failed') {
     const s = settings();
@@ -8783,6 +8862,7 @@ async function generateGodlogForRowUnlocked(row, force = false) {
   saveMemory();
   showStatus(`正在写逐楼摘要：第 ${row.index} 楼`);
 
+  let summaryCommitted = false;
   try {
     const basePrompt = buildGodlogPrompt(data, row, item);
     let body = '';
@@ -8904,21 +8984,27 @@ async function generateGodlogForRowUnlocked(row, force = false) {
     refreshCoverageMaps(data);
     refreshTimelineFromGodlogs(data);
     data.processing.lastError = '';
+    // COMMIT BOUNDARY: from this line onward the Godlog is a durable success. Hide/Codex/entity/
+    // vector work is best-effort post-processing and is forbidden from falling into the summary
+    // retry catch below. This prevents the v1.1.1 loop: ready -> vector error -> pending -> rewrite.
     saveMemory(true);
-    await enforceAnchorHiddenState(data);
+    summaryCommitted = true;
+    await runGodlogPostCommitTasks(data, latestRow, item, contextToken);
     if (!isSameChatContext(contextToken)) return false;
-    await updateCodexFromGodlog(data, latestRow, item);
-    if (!isSameChatContext(contextToken)) return false;
-    refreshItemEventTimeline(data, { row: latestRow });
-    // If this floor previously relied on raw-recall, retire that fallback vector now that the
-    // canonical Godlog exists.
-    removeStoredVector(data, rawRecallItem(latestRow).id);
-    await ensureRecallVectorsForRow(data, latestRow, item, null);
-    saveMemory(true);
     if (force && existing) queueMemoryJob('逐楼摘要已手动重跑', 120);
     return true;
   } catch (err) {
     if (!isSameChatContext(contextToken)) return false;
+    // Absolute safety net: once the validated Godlog crossed the commit boundary, no later error
+    // may demote it or schedule another summary API request. runGodlogPostCommitTasks already
+    // isolates known post-processors; this guard also covers unexpected future post-commit code.
+    if (summaryCommitted) {
+      const message = String(err?.message || err || '未知后处理错误');
+      data.processing.lastPostprocessError = `摘要已成功保存；后处理异常：${message}`;
+      console.warn('[AnchorMemory] Godlog已提交，忽略后续异常，不重跑摘要:', err);
+      saveMemory(true);
+      return true;
+    }
     const nonRetryable = summaryErrorIsNonRetryable(err);
     if (replacingCompleted) {
       const retryCount = (item.rerunRetryCount || 0) + 1;
@@ -10746,7 +10832,7 @@ function renderGodlogPanelForIndex(messageIndex, prepared = null) {
         <div class="am-message-godlog-text">${escapeHtml(body)}</div>
         <div class="am-message-godlog-actions">
           <button class="am-message-godlog-open" type="button">打开摘要页</button>
-          <button class="am-message-godlog-rerun" type="button" ${isSummaryRowBusy(row) || item?.rerunQueued ? 'disabled' : ''}>${isSummaryRowBusy(row) ? '正在重跑…' : (item?.rerunQueued ? '已排队重跑' : '重跑本楼摘要')}</button>
+          <button class="am-message-godlog-rerun" type="button" ${isSummaryRowBusy(row) || item?.rerunQueued ? 'disabled' : ''}>${isSummaryRowBusy(row) ? ((item?.rerunPending || item?.rerunQueued || state.forcedSummaryReruns.has(row.key)) ? '正在重跑…' : '正在生成…') : (item?.rerunQueued ? '已排队重跑' : '重跑本楼摘要')}</button>
         </div>
       </div>
     </div>
