@@ -26,7 +26,8 @@ import {
   makeStableMessageKey,
   isCompletedSummary,
   summaryRevisionHash,
-  lockCompletedSummaryToSavedSnapshot,
+  rememberSummaryRevision,
+  restoreSummaryRevision,
 } from './core/summary-lifecycle.js';
 import {
   chunkNarrativeText,
@@ -157,7 +158,7 @@ function isGenerationActive() {
 
 
 const MODULE = 'anchor_memory';
-const EXTENSION_VERSION = '1.1.2';
+const EXTENSION_VERSION = '1.1.3-rp.1';
 const DATA_KEY = 'anchorMemory';
 const CORE_PROMPT_KEY = 'anchor_memory_core';
 const RECALL_PROMPT_KEY = 'anchor_memory_recall';
@@ -408,6 +409,7 @@ const state = {
   latestRowHash: '',
   latestRowChangedAt: 0,
   generationEndedAt: 0,
+  replacementTarget: null,
   generationLifecycleActive: false,
   generationStartedAt: 0,
   rowRevisionState: new Map(),
@@ -623,6 +625,7 @@ function stopRuntimeForPluginPause(reason = 'plugin-paused') {
   state.jobRunning = false;
   state.pendingIntervalRecheck = false;
   clearAllSummaryRuntimeTasks();
+  state.replacementTarget = null;
   state.generationLifecycleActive = false;
   state.generationStartedAt = 0;
   state.generationEndedAt = 0;
@@ -2274,7 +2277,8 @@ function buildCanonContextBlock(data, row, godlog = null, maxChars = 7200) {
   if (worldCanon.length) parts.push(`## 世界书/设定书相关条目\n${worldCanon.join('\n')}`);
   const recentOriginal = collectRecentOriginalContext(row, 8);
   if (recentOriginal.length) parts.push(`## 当前楼之前的近几条原文\n${recentOriginal.join('\n')}`);
-  if (data?.codex?.peopleIndex) parts.push(`## 已有人物关系事实\n${safeCodexText(data.codex.peopleIndex, 1800)}`);
+  const safeCodex = injectionCodex(data);
+  if (safeCodex?.peopleIndex) parts.push(`## 已有人物关系事实\n${safeCodexText(safeCodex.peopleIndex, 1800)}`);
   if (!data?.processing?.relationshipDirty && relationshipHasContent(data?.relationshipTable)) {
     parts.push(`## 固定人物与${renderMacros('{{user}}')}的关系表\n${safeCodexText(relationshipTableMarkdown(data.relationshipTable, true), 2200)}`);
   }
@@ -2897,13 +2901,10 @@ function syncGodlogCount(data) {
 }
 
 function isGodlogReady(item, row = null) {
-  // Completed summaries are durable snapshots. A later prompt injection, render refresh, tool
-  // payload, swipe metadata update or even a deliberate text edit must not silently turn the card
-  // into “missing” and start a background rewrite. The user explicitly chooses when to replace it
-  // through “重跑本楼摘要” or by editing/saving the summary.
-  if (!isCompletedSummary(item)) return false;
-  if (row && item.archived) return false;
-  return true;
+  if (!item || item.archived) return false;
+  const current = currentRowForGodlog(item);
+  if (row && (!current || row.key !== current.key || row.rawHash !== current.rawHash)) return false;
+  return !!current && !isReplacementSource(current) && isCompletedSummary(item, current);
 }
 
 
@@ -2990,6 +2991,7 @@ function blockedRebuildGodlogRows(data) {
 }
 
 function anchorMaterialForRow(data, row, rows = chatRows(true)) {
+  if (isReplacementSource(row)) return null;
   const godlog = godlogForRow(data, row);
   if (isGodlogReady(godlog, row)) return { row, godlog, mode: 'godlog' };
   // A failed/pending summary must not permanently freeze every later 15-turn anchor. Keep the
@@ -3021,7 +3023,7 @@ function pendingAnchorMaterials(data) {
 
 function readyGodlogMemoryItems(data) {
   return (data?.godlogs || [])
-    .filter(item => item?.status === 'ready' && item.body && !item.stale);
+    .filter(item => isGodlogReady(item));
 }
 
 function pendingRows(data) {
@@ -3189,13 +3191,14 @@ function maybeWarnMissingGodlogs(data = memoryData()) {
 }
 
 function rawFallbackTextForRow(row, maxChars = 1800) {
+  if (isReplacementSource(row)) return '';
   const source = sanitizeMainPromptMemoryText(row?.turnText || row?.text || '');
   if (!source) return '';
   return clampTextHeadTail(source, Math.max(320, Number(maxChars) || 1800), 0.38);
 }
 
 function rawFallbackEligible(row, rows = chatRows(true)) {
-  if (!row || row.role !== 'assistant' || !(row.turnText || row.text)) return false;
+  if (!row || isReplacementSource(row) || row.role !== 'assistant' || !(row.turnText || row.text)) return false;
   const recentKeys = new Set((rows || [])
     .filter(item => item.role === 'assistant')
     .slice(-Math.max(1, Number(settings().keepRecent) || 3))
@@ -3858,7 +3861,7 @@ function refreshTimelineFromGodlogs(data) {
   const manual = timeline.manualOverride && typeof timeline.manualOverride === 'object' ? timeline.manualOverride : null;
   const minimumFloor = manual && Number.isFinite(Number(manual.floor)) ? Number(manual.floor) : -1;
   const entries = (data.godlogs || [])
-    .filter(item => item && item.status === 'ready' && !item.stale && !item.archived && item.body)
+    .filter(item => isGodlogReady(item))
     .filter(item => Number(item.floor ?? -1) > minimumFloor)
     .sort((a, b) => Number(a.floor ?? -1) - Number(b.floor ?? -1))
     .map(item => ({
@@ -3881,7 +3884,7 @@ function refreshTimelineFromGodlogs(data) {
     data.codex.currentPlace = manual.currentPlace;
   } else {
     const latestPlace = [...(data.godlogs || [])]
-      .filter(item => item && item.status === 'ready' && !item.stale && !item.archived && item.body)
+      .filter(item => isGodlogReady(item))
       .sort((a, b) => Number(b.floor ?? -1) - Number(a.floor ?? -1))
       .map(item => godlogFieldValue(item.body, 'Pln'))
       .find(value => usefulCodexValue(value));
@@ -4454,10 +4457,17 @@ function buildGodlogPrompt(data, row, item = null) {
     ? '当前回合包含用户输入与随后的AI回复。'
     : '当前回合没有用户输入，这是首条AI开场楼或单独AI楼；必须直接总结这条AI回复里的开场设定、已发生动作、地点、人物状态和可确认信息，不要因为缺少用户输入而输出空内容。';
   const canon = buildCanonContextBlock(data, row, null, 5200);
+  const safeCodex = injectionCodex(data);
 
   return `${renderTemplate(settings().godlogRules || DEFAULT_GODLOG_RULES)}
 
 请只为当前回合写 Godlog。通常当前回合 = 用户输入 + 随后的AI回复；如果没有用户输入，则当前回合 = 这条AI开场/AI回复本身。Godlog 只返回给本次后台摘要任务，插件会单独渲染静态摘要卡；不要把 Godlog 写回 AI 回复正文，不要使用 Markdown 代码块，不要总结其他回合，不要输出HTML标签。
+
+跑团事实边界：
+- 必须区分已发生、尝试/计划、角色推测、传闻、梦境/回忆与明确否定；保留这些限定词。
+- 仅记录正文明确的结果。没有明确判定时，不把尝试写成成功，不推算伤害、库存、金钱或技能数值。
+- 物品转移、伤势、任务进度与承诺须保留主体、变化和结果；未提及不代表消失或恢复。
+- 标明信息由谁获知；秘密、玩家视角与某角色的猜测不自动成为全体角色的共同知识。
 
 身份与关系判定边界：
 - 角色卡、角色书、世界书是稳定身份和既有关系的最高依据；当前楼只记录“这一楼发生了什么”。
@@ -4474,8 +4484,8 @@ ${canon}
 ${clampText(previous, 2200)}
 
 ## 当前已知剧情定位（只作线索；原文冲突时以原文为准）
-时间：${data.codex.currentTime || '未明'}
-地点：${data.codex.currentPlace || '未明'}
+时间：${safeCodex?.currentTime || '未明'}
+地点：${safeCodex?.currentPlace || '未明'}
 
 ## 当前楼层标识
 Nub: ${item?.number || godlogNumberForRow(row) || data.processing.godlogCount + 1}
@@ -4580,7 +4590,8 @@ ${currentFacts || cleanText(row.turnText || row.text)}`;
 }
 
 async function updateCodexFromGodlog(data, row, godlog, force = false) {
-  if (!data || !row || !godlog || godlog.status !== 'ready' || !godlog.body) return false;
+  invalidateRuntimeCaches();
+  if (!data || !row || !isGodlogReady(godlog, row)) return false;
   const s = settings();
   if (!secondaryConfigured(s)) return false;
   if (data.processing?.codexDirty && !force) {
@@ -4593,11 +4604,13 @@ async function updateCodexFromGodlog(data, row, godlog, force = false) {
   const contextToken = captureChatContextToken(data);
 
   try {
+    const sourceRevision = captureSourceRevision(data);
     const patch = await callSecondary([
       { role: 'system', content: 'You update private roleplay memory indexes for a background task. Output only the requested Markdown tables. Never write visible chat content.' },
       { role: 'user', content: buildCodexPatchPrompt(data, row, godlog) },
     ], 3000);
     if (!isSameChatContext(contextToken)) return false;
+    if (!isSourceRevisionCurrent(data, sourceRevision)) return false;
     validateCodexPatchStructure(data, patch);
 
     // Build the whole update on a detached candidate. No active index/table is modified until every
@@ -4739,6 +4752,7 @@ async function rebuildCodexFromGodlogs(confirmFirst = true) {
     return false;
   }
 
+  const sourceRevision = captureSourceRevision(data);
   const chunks = buildCodexRebuildChunks(materials);
   const checkpoint = normalizeCodexRebuildCheckpoint(data, materials, chunks);
   const resumeAt = Math.min(checkpoint.cursor, chunks.length);
@@ -4772,6 +4786,7 @@ async function rebuildCodexFromGodlogs(confirmFirst = true) {
         { role: 'user', content: prompt },
       ], 4200, { taskLabel: `人物索引重建第 ${index + 1}/${chunks.length} 段` });
       if (!isSameChatContext(contextToken)) return false;
+      if (!isSourceRevisionCurrent(data, sourceRevision)) return false;
       validateCodexPatchStructure(data, patch);
 
       const nextHolder = {
@@ -5177,8 +5192,10 @@ async function rewriteAnchorItemUnlocked(data, anchor, contextToken) {
   showStatus(`正在重写第 ${anchor?.number || 1} 次分段锚点`);
   try {
     const number = Number(anchor?.number || 1);
+    const sourceRevision = captureSourceRevision(data);
     const body = normalizeAnchorBody(await callDerivedWriter(buildAnchorRewritePrompt(data, anchor, source.materials, source.missingKeys), 5200, '锚点重写'), number);
     if (!isSameChatContext(contextToken)) return false;
+    if (!isSourceRevisionCurrent(data, sourceRevision)) return false;
     if (!body || body.trim().length < 100) throw new Error('重写后的锚点内容为空或过短');
 
     const previousBody = anchor.body;
@@ -5219,8 +5236,10 @@ async function rewriteMergeItemUnlocked(data, merge, contextToken) {
     const prompt = plan.cycleSourceKeys.length
       ? buildMergeSourceRewritePrompt(data, merge, plan)
       : buildMergeRewritePrompt(data, merge);
+    const sourceRevision = captureSourceRevision(data);
     const body = normalizeMergeBody(await callDerivedWriter(prompt, 6200, '累计历史重写'), number);
     if (!isSameChatContext(contextToken)) return false;
+    if (!isSourceRevisionCurrent(data, sourceRevision)) return false;
     if (!body || body.trim().length < 120) throw new Error('重写后的合并内容为空或过短');
 
     const previousBody = merge.body;
@@ -5513,6 +5532,10 @@ function itemEventTimelineInjectionBlock(data, chat, maxEventsPerItem = 12) {
   for (const key of matchedKeys.slice(0, 4)) {
     const item = entities.items.byKey[key];
     const allEvents = [...(entities.itemEvents?.byKey?.[key] || [])]
+      .filter(event => {
+        const row = rowByStableKey(event.key);
+        return row && !isReplacementSource(row) && event.rawHash === row.rawHash;
+      })
       .sort((a, b) => Number(a.floor ?? -1) - Number(b.floor ?? -1));
     if (!allEvents.length) continue;
     const limit = Math.max(3, Number(maxEventsPerItem) || 12);
@@ -5758,7 +5781,7 @@ ${text}`);
 }
 
 function rawRecallItem(row) {
-  const rawText = row?.turnText || row?.text || '';
+  const rawText = isReplacementSource(row) ? '' : (row?.turnText || row?.text || '');
   const narrative = taggedNarrativeContent(rawText) || cleanText(rawText);
   const body = clampTextHeadTail(narrative, 3600, 0.42);
   const sourceRevision = row?.rawHash || stableHash(rawText);
@@ -5768,6 +5791,7 @@ function rawRecallItem(row) {
     number: row?.assistantNumber || 0,
     floor: row?.index ?? null,
     kind: 'raw-recall',
+    rawHash: row?.rawHash || '',
     body,
     title: '原楼正文保底',
   };
@@ -6819,7 +6843,7 @@ function fuseHybridRecall(vectorHits = [], keywordHits = [], limit = recallCandi
 }
 
 function rawChunkHitFromRecord(record, row, score = 0, method = 'embedding') {
-  if (!record || !row || record.rawHash !== row.rawHash) return null;
+  if (!record || !row || isReplacementSource(row) || record.rawHash !== row.rawHash) return null;
   const source = String(row.turnText || row.text || '');
   const start = Math.max(0, Number(record.start) || 0);
   const end = Math.min(source.length, Math.max(start + 1, Number(record.end) || source.length));
@@ -7097,7 +7121,10 @@ function recallQueryMessageText(message) {
 }
 
 function buildRecallQuery(chat = getContext().chat || []) {
-  const visible = (chat || []).filter(message => message && !message.is_system && !message.is_hidden);
+  const target = state.replacementTarget;
+  const visible = (chat || []).filter(message => message && !message.is_system && !message.is_hidden
+    && (!target || (message !== getContext().chat?.[target.floor]
+      && message.anchor_memory_meta?.stableMessageKey !== target.key)));
   const lastUser = [...visible].reverse().find(message => message.is_user);
   const lastUserText = recallQueryMessageText(lastUser);
   const recentNarrative = visible.slice(-4)
@@ -7391,7 +7418,8 @@ function dynamicRecall(data, chat, rows = chatRows(true), options = {}) {
     ? options.recentFactsMeta
     : (state.lastRecentFactsMeta || []);
   const deterministicIds = new Set(deterministicRefs.map(ref => ref.id).filter(Boolean));
-  recalled = recalled.filter(hit => ['godlog', 'raw-recall', 'raw-chunk'].includes(hit.kind)
+  recalled = recalled.filter(hit => recallHitIsCurrent(data, hit)
+    && ['godlog', 'raw-recall', 'raw-chunk'].includes(hit.kind)
     && !deterministicIds.has(hit.item?.id)
     && !recentRawKeys.has(hit.item?.key));
 
@@ -7545,6 +7573,7 @@ function currentMemoryTokenBudget(chat = getContext().chat || []) {
 }
 
 async function buildPromptReadyInjection(chat = getContext().chat || [], options = {}) {
+  syncGodlogsWithChat('实际注入前核对当前回复版本');
   const commit = options.commit !== false;
   const data = memoryData();
   const rows = chatRows(true);
@@ -8086,19 +8115,23 @@ function forgetGodlogItem(data, item, reason = '源楼层已变动', includeUser
 
 function preserveCompletedGodlogOnSourceChange(data, item, row, reason = '楼层在摘要完成后发生了变化') {
   if (!data || !item || !row) return false;
-  const changed = lockCompletedSummaryToSavedSnapshot(item, row, reason);
-  if (!changed) return false;
-  rememberMessageGodlogCard(data, row, item, 'ready');
-  refreshCoverageMaps(data);
-  return true;
+  if (item.rawHash !== row.rawHash || item.sourceMismatch) {
+    return markGodlogForSourceRefresh(data, item, row, reason);
+  }
+  return false;
 }
 
 function markGodlogForSourceRefresh(data, item, row, reason = '源楼层内容已更新') {
   if (!data || !item || !row) return false;
-  noteRowRevision(row, true);
-  const wasCurrent = item.rawHash === row.rawHash && item.status === 'stale' && item.stale;
+  const wasCurrent = item.currentRawHash === row.rawHash && item.stale;
   if (wasCurrent) return false;
+  noteRowRevision(row, true);
 
+  rememberSummaryRevision(item);
+  clearSummaryRetryTimer(item.key);
+  clearRecallPrefetch();
+  state.lastRecall = '';
+  state.lastRecallMeta = [];
   // Keep the last completed body visible as a temporary card, but immediately revoke it from
   // anchors, embeddings, codex, and prompt injection because it no longer matches the source.
   markAnchorsStaleByKey(data, item.key, reason);
@@ -8118,12 +8151,18 @@ function markGodlogForSourceRefresh(data, item, row, reason = '源楼层内容�
     name: row.name,
     sendDate: row.sendDate,
     previousRawHash: item.rawHash || item.previousRawHash || '',
-    rawHash: row.rawHash,
+    currentRawHash: row.rawHash,
+    sourceMismatch: true,
+    sourceMismatchReason: reason,
+    retryCount: 0,
+    retryScheduledAt: 0,
+    pendingGeneratedBody: '',
+    pendingGeneratedRawHash: '',
     status: hasOldBody ? 'stale' : 'pending',
     stale: hasOldBody,
     staleSince: Date.now(),
     error: hasOldBody
-      ? '楼层内容仍在更新；旧摘要暂时保留，正文稳定后会自动刷新。'
+      ? '当前回复已换版；旧摘要已退出记忆，正文稳定后自动刷新。'
       : '楼层内容仍在更新；正文稳定后才会生成摘要。',
     updatedAt: item.updatedAt || Date.now(),
   });
@@ -8176,6 +8215,7 @@ function remapGodlogSourceKey(data, item, nextKey) {
 
 function syncGodlogsWithChat(reason = '聊天变动') {
   if (!hasPersistentChatContext()) return false;
+  invalidateRuntimeCaches();
   const data = memoryData();
   let changed = ensureLegacyGodlogCleanup();
   const rows = chatRows(true);
@@ -8187,7 +8227,13 @@ function syncGodlogsWithChat(reason = '聊天变动') {
     if (!row || row.role !== 'assistant') {
       if (!row && activeSummarySourceLookupDeferred(item)) {
         // A transient host re-render is not a deletion. Keep the pending record and postpone the
-        // destructive rollback until the active summary request and its grace window have ended.
+        // record removal, but revoke its derived facts immediately while the source is unverified.
+        if (!item.sourceLookupDeferredAt) {
+          markGodlogForSourceRefresh(data, item, {
+            key: item.key, index: Number(item.floor ?? -1), role: item.role,
+            name: item.name, sendDate: item.sendDate, rawHash: '',
+          }, '源楼暂不可确认，旧记忆暂停参与注入');
+        }
         item.sourceLookupDeferredAt = item.sourceLookupDeferredAt || Date.now();
         changed = true;
         continue;
@@ -8215,15 +8261,13 @@ function syncGodlogsWithChat(reason = '聊天变动') {
       changed = true;
     }
 
-    if (item.rawHash && item.rawHash !== row.rawHash) {
-      changed = isCompletedSummary(item)
-        ? preserveCompletedGodlogOnSourceChange(data, item, row, reason || '楼层在摘要完成后发生了变化') || changed
-        : markGodlogForSourceRefresh(data, item, row, reason || '源楼层已编辑或重生成') || changed;
-      continue;
+    if (!item.rawHash || item.rawHash !== row.rawHash || item.sourceMismatch || isReplacementSource(row)) {
+      changed = markGodlogForSourceRefresh(data, item, row, reason || '当前回复版本已变化') || changed;
     }
-
-    if (item.sourceMismatch || item.currentRawHash || item.sourceMismatchReason) {
-      changed = preserveCompletedGodlogOnSourceChange(data, item, row, '') || changed;
+    if (!isReplacementSource(row) && !isGodlogReady(item, row) && !isSummaryRowBusy(item.key)
+        && restoreSummaryRevision(item, row)) {
+      rememberMessageGodlogCard(data, row, item, 'ready');
+      changed = true;
     }
 
     if (syncGodlogNumber(item, row)) {
@@ -8233,6 +8277,17 @@ function syncGodlogsWithChat(reason = '聊天变动') {
     }
   }
 
+  // Raw-fallback anchors also need invalidation when there was no completed Godlog to revoke.
+  for (const derived of [...(data.anchors || []), ...(data.merges || [])]) {
+    for (const [key, hash] of Object.entries(derived.sourceRevisions || {})) {
+      const row = byKey.get(key);
+      if (!row || row.rawHash !== hash || isReplacementSource(row)) {
+        markAnchorsStaleByKey(data, key, reason);
+        changed = true;
+        break;
+      }
+    }
+  }
   syncGodlogCount(data);
   refreshTimelineFromGodlogs(data);
   refreshCoverageMaps(data);
@@ -8590,29 +8645,77 @@ async function enforceAnchorHiddenState(data = memoryData()) {
 
 function currentRowForGodlog(item, includeUser = false) {
   if (!item) return null;
-  const rows = chatRows(true, includeUser);
-  const exact = rows.find(row => row.key === item.key);
-  if (exact) return exact;
-  const assistantRows = rows.filter(row => row.role === 'assistant');
+  // Never adopt a deleted message's summary by floor number, date, or identical text.
+  // The host may reuse a floor for a new message; only the persisted plugin identity is safe.
+  return chatRows(true, includeUser).find(row => row.key === item.key) || null;
+}
 
-  // SillyTavern can briefly replace/normalize a message object while a background request is in
-  // flight. Resolve the same narrative floor by immutable content/date/assistant ordinal before
-  // declaring it deleted; source-hash validation later still prevents committing to a wrong row.
-  if (item.rawHash) {
-    const hashMatches = assistantRows.filter(row => row.rawHash === item.rawHash);
-    if (hashMatches.length === 1) return hashMatches[0];
+function isReplacementSource(row) {
+  const target = state.replacementTarget;
+  return !!(row && target && (row.key === target.key || row.index === target.floor));
+}
+
+function prepareReplacementGeneration(type) {
+  if (!['swipe', 'regenerate'].includes(type) || state.replacementTarget) return;
+  invalidateRuntimeCaches();
+  const row = latestAssistantRow();
+  // A regenerate interceptor may run after the host has already removed the target.
+  // The early GENERATION_STARTED event is authoritative; never guess an earlier floor here.
+  if (!row || !state.generationLifecycleActive) return;
+  const chat = getContext().chat || [];
+  if (row.index !== chat.length - 1) return;
+  state.replacementTarget = { key: row.key, floor: row.index };
+  const data = memoryData();
+  const item = godlogForRow(data, row);
+  if (item) markGodlogForSourceRefresh(data, item, row, '正在重新生成本楼，原版本退出记忆');
+  else {
+    markAnchorsStaleByKey(data, row.key, '正在重新生成本楼');
+    rollbackRelationshipToFloor(data, row.index - 1, '正在重新生成本楼');
+    markCodexDirty(data, '正在重新生成本楼', true, false, row.index);
   }
-  if (item.sendDate) {
-    const dateMatches = assistantRows.filter(row => row.sendDate && row.sendDate === item.sendDate);
-    if (dateMatches.length === 1) return dateMatches[0];
+  clearRecallPrefetch();
+  clearInjectedPromptState();
+  saveMemory(true);
+}
+
+function recallHitIsCurrent(data, hit) {
+  const row = rowByStableKey(hit?.item?.key);
+  if (!row || isReplacementSource(row)) return false;
+  if (hit.kind === 'godlog') {
+    const current = godlogForRow(data, row);
+    return isGodlogReady(current, row) && current.id === hit.item.id
+      && current.body === hit.item.body && hit.item.rawHash === row.rawHash;
   }
-  if (Number(item.assistantNumber) > 0) {
-    const ordinalMatches = assistantRows.filter(row => Number(row.assistantNumber) === Number(item.assistantNumber));
-    if (ordinalMatches.length === 1) return ordinalMatches[0];
+  return !!hit.item.rawHash && hit.item.rawHash === row.rawHash;
+}
+
+function captureSourceRevision(data, keys = null) {
+  invalidateRuntimeCaches();
+  const selected = keys ? new Set(keys) : null;
+  return {
+    rows: chatRows(true).filter(row => row.role === 'assistant' && (!selected || selected.has(row.key)))
+      .map(row => ({ key: row.key, rawHash: row.rawHash, summary: sourceSummarySignature(data, row) })),
+    derived: JSON.stringify([data.anchors, data.merges].map(list => (list || []).map(item => [item.id, item.body]))),
+  };
+}
+
+function sourceSummarySignature(data, row) {
+  const item = godlogForRow(data, row);
+  return JSON.stringify(item ? [item.id, item.rawHash, item.status, !!item.stale, !!item.sourceMismatch, item.body] : null);
+}
+
+function isSourceRevisionCurrent(data, snapshot) {
+  invalidateRuntimeCaches();
+  const valid = snapshot.rows.every(saved => {
+    const row = rowByStableKey(saved.key);
+    return row && !isReplacementSource(row) && row.rawHash === saved.rawHash
+      && sourceSummarySignature(data, row) === saved.summary;
+  }) && snapshot.derived === JSON.stringify([data.anchors, data.merges].map(list => (list || []).map(item => [item.id, item.body])));
+  if (!valid) {
+    syncGodlogsWithChat('后台任务来源已变化，丢弃旧结果');
+    queueMemoryJob('按当前版本重新整理记忆', 180);
   }
-  const floorMatches = assistantRows.filter(row => Number(row.index) === Number(item.floor));
-  if (floorMatches.length === 1) return floorMatches[0];
-  return null;
+  return valid;
 }
 
 
@@ -8748,7 +8851,7 @@ function syncLatestGodlogPositionFields(data) {
 async function runGodlogPostCommitTasks(data, row, item, contextToken) {
   const errors = [];
   const runStep = async (label, fn) => {
-    if (!isSameChatContext(contextToken)) return false;
+    if (!isSameChatContext(contextToken) || !isGodlogReady(item, currentRowForGodlog(item))) return false;
     try {
       await fn();
       return true;
@@ -8810,7 +8913,14 @@ async function generateGodlogForRowUnlocked(row, force = false) {
   const data = memoryData();
   const contextToken = captureChatContextToken(data);
   const operationEpoch = state.contextEpoch;
+  invalidateRuntimeCaches();
+  const liveRow = rowByStableKey(row.key);
+  if (!liveRow || liveRow.rawHash !== row.rawHash || isReplacementSource(liveRow)) return false;
   const existing = godlogForRow(data, row);
+  const manualRevision = Number(existing?.editedAt || 0);
+  if (existing && !isGodlogReady(existing, row) && (existing.rawHash !== row.rawHash || existing.sourceMismatch)) {
+    markGodlogForSourceRefresh(data, existing, row, '摘要开始前核对版本');
+  }
   const replacingCompleted = !!(force && isCompletedSummary(existing));
 
   if (!force && isGodlogReady(existing, row)) {
@@ -8896,6 +9006,9 @@ async function generateGodlogForRowUnlocked(row, force = false) {
 
     // Never commit against a source revision different from the one sent to the writer. For a
     // manual rerun, keep the old ready snapshot untouched instead of demoting it to missing/stale.
+    invalidateRuntimeCaches();
+    if (!(data.godlogs || []).includes(item) || isReplacementSource(row)
+        || Number(item.editedAt || 0) !== manualRevision) return false;
     let latestRow = currentRowForGodlog(item);
     if (!latestRow) {
       invalidateRuntimeCaches('summary source re-resolve');
@@ -8905,10 +9018,13 @@ async function generateGodlogForRowUnlocked(row, force = false) {
       if (replacingCompleted) {
         item.rerunPending = false;
         item.rerunError = latestRow
-          ? '重跑期间楼层内容继续变化；旧摘要仍然保留，请在正文稳定后手动重跑。'
-          : '重跑结束时暂未定位到源楼层；旧摘要仍然保留，插件会延迟确认，不会立即回滚关系表。';
+          ? '重跑期间正文已换版；旧摘要退出记忆，等待新正文稳定后自动补写。'
+          : '重跑结束时未定位到源楼；旧摘要只供核对，源楼确认前不参与记忆。';
         item.rerunFinishedAt = Date.now();
-        if (latestRow) preserveCompletedGodlogOnSourceChange(data, item, latestRow, '重跑期间楼层内容发生变化');
+        if (latestRow) {
+          markGodlogForSourceRefresh(data, item, latestRow, '重跑期间楼层内容发生变化');
+          scheduleMemoryAfterSettle('重跑期间换版，等待新正文', latestRow);
+        }
         else {
           item.sourceLookupDeferredAt = Date.now();
           scheduleDeferredSummarySourceCheck(item, contextToken);
@@ -8929,7 +9045,7 @@ async function generateGodlogForRowUnlocked(row, force = false) {
         item.pendingGeneratedRawHash = sourceHash;
         item.sourceLookupDeferredAt = Date.now();
         item.status = 'pending';
-        item.error = '摘要已生成，正在等待酒馆确认源楼层稳定；期间不会回滚人物关系或状态表。';
+        item.error = '摘要已生成，正在等待酒馆确认源楼；未确认的内容不参与当前记忆。';
         scheduleDeferredSummarySourceCheck(item, contextToken);
       }
       saveMemory(true);
@@ -8998,6 +9114,12 @@ async function generateGodlogForRowUnlocked(row, force = false) {
     // Absolute safety net: once the validated Godlog crossed the commit boundary, no later error
     // may demote it or schedule another summary API request. runGodlogPostCommitTasks already
     // isolates known post-processors; this guard also covers unexpected future post-commit code.
+    invalidateRuntimeCaches();
+    const failedSource = rowByStableKey(row.key);
+    if (!(data.godlogs || []).includes(item) || !failedSource || isReplacementSource(failedSource) || failedSource.rawHash !== sourceHash) {
+      if (failedSource && (data.godlogs || []).includes(item)) markGodlogForSourceRefresh(data, item, failedSource, '旧版本摘要请求已结束');
+      return false;
+    }
     if (summaryCommitted) {
       const message = String(err?.message || err || '未知后处理错误');
       data.processing.lastPostprocessError = `摘要已成功保存；后处理异常：${message}`;
@@ -9487,6 +9609,7 @@ function restoreTemporaryContextReplacement(outbound, backups) {
 
 async function createAnchorUnlocked(force = false, customMaterials = null, intervalOptions = {}) {
   if (!hasPersistentChatContext()) return false;
+  syncGodlogsWithChat('生成锚点前核对来源');
   const anchorIntervalAtStart = normalizeAnchorInterval(intervalOptions.anchorInterval ?? settings().anchorInterval);
   const mergeAnchorIntervalAtStart = normalizeMergeAnchorInterval(intervalOptions.mergeAnchorInterval ?? settings().mergeAnchorInterval);
   let data = memoryData();
@@ -9506,7 +9629,11 @@ async function createAnchorUnlocked(force = false, customMaterials = null, inter
     if (force) toastr?.info?.('没有连续且已完成的未锚定摘要', 'Anchor Memory');
     return false;
   }
-  if (!force && materials.some(item => item.mode !== 'raw-fallback' && !isGodlogReady(item.godlog, item.row))) return false;
+  if (materials.some(item => {
+    const live = rowByStableKey(item.row?.key);
+    return !live || isReplacementSource(live) || live.rawHash !== item.row.rawHash
+      || (item.mode !== 'raw-fallback' && !isGodlogReady(item.godlog, live));
+  })) return false;
 
   state.running = true;
   data.processing.busy = true;
@@ -9516,8 +9643,10 @@ async function createAnchorUnlocked(force = false, customMaterials = null, inter
 
   try {
     const number = data.processing.anchorCount + 1;
+    const sourceRevision = captureSourceRevision(data);
     const body = normalizeAnchorBody(await callDerivedWriter(buildAnchorPrompt(data, materials), 4200, '分段锚点'), number);
     if (!isSameChatContext(contextToken)) return false;
+    if (!isSourceRevisionCurrent(data, sourceRevision)) return false;
     if (!body || body.trim().length < 60) throw new Error('锚点内容为空或过短');
     const rows = materials.map(item => item.row);
     const sourceFloors = rows.map(row => row.index);
@@ -9532,6 +9661,7 @@ async function createAnchorUnlocked(force = false, customMaterials = null, inter
       body: body.trim(),
       sourceFloors,
       sourceKeys,
+      sourceRevisions: Object.fromEntries(rows.map(row => [row.key, row.rawHash])),
       sourceGodlogIds,
       rawFallbackKeys: materials.filter(item => item.mode === 'raw-fallback').map(item => item.row.key),
       intervalUsed: interval,
@@ -9593,6 +9723,7 @@ async function createAnchor(force = false, customMaterials = null, intervalOptio
 
 async function maybeMergeUnlocked(force = false, intervalOverride = null) {
   if (!hasPersistentChatContext()) return false;
+  syncGodlogsWithChat('累计合并前核对来源');
   if (state.running && force) {
     toastr?.warning?.('锚点任务正在运行，稍后再合并', 'Anchor Memory');
     return false;
@@ -9664,8 +9795,10 @@ async function maybeMergeUnlocked(force = false, intervalOverride = null) {
     : `正在更新累计历史：${anchorCount} 个分段锚点`);
   try {
     const mergeNumber = data.processing.mergeCount + 1;
+    const sourceRevision = captureSourceRevision(data);
     const body = normalizeMergeBody(await callDerivedWriter(buildMergePrompt(data, plan, force), 6200, '累计历史'), mergeNumber);
     if (!isSameChatContext(contextToken)) return false;
+    if (!isSourceRevisionCurrent(data, sourceRevision)) return false;
     if (!body || body.trim().length < 120) throw new Error('合并内容为空或过短');
 
     const previous = latestMerge(data);
@@ -9678,6 +9811,7 @@ async function maybeMergeUnlocked(force = false, intervalOverride = null) {
       kind: 'merge',
       body: body.trim(),
       sourceKeys: cumulativeKeys,
+      sourceRevisions: Object.fromEntries(chatRows(true).filter(row => cumulativeKeys.includes(row.key)).map(row => [row.key, row.rawHash])),
       cycleSourceKeys: sourceKeys,
       sourceAnchorIds: blocks.filter(block => block.kind === 'anchor').map(block => block.item.id),
       sourceGodlogIds: blocks.filter(block => block.kind === 'godlog' && block.item?.id).map(block => block.item.id),
@@ -10004,8 +10138,8 @@ function onUserMessageRendered() {
   reconcileStrictRecentWindow('用户消息写入后').catch(console.warn);
 }
 
-function onGenerationAfterCommands() {
-  if (!settings().enabled) return;
+function onGenerationAfterCommands(type, _options, dryRun = false) {
+  if (!settings().enabled || dryRun || type === 'quiet' || type === 'impersonate') return;
   // Run before SillyTavern assembles the final prompt so hidden flags affect every backend, not only
   // Chat Completion payloads that emit CHAT_COMPLETION_PROMPT_READY.
   const chat = getContext().chat || [];
@@ -10014,9 +10148,10 @@ function onGenerationAfterCommands() {
   reconcileStrictRecentWindow('正式构造请求前').catch(console.warn);
 }
 
-function onGenerationStarted() {
-  if (!settings().enabled) return;
+function onGenerationStarted(type, _options, dryRun = false) {
+  if (!settings().enabled || dryRun || type === 'quiet' || type === 'impersonate') return;
   state.generationLifecycleActive = true;
+  prepareReplacementGeneration(type);
   state.generationStartedAt = Date.now();
   // The latest floor may be about to be regenerated/swiped. Its old finalized hash must not grant
   // the new generation an immediate-summary bypass before the new body is committed.
@@ -10029,11 +10164,13 @@ function onGenerationStarted() {
 function onGenerationFinished(source = '生成结束') {
   if (!settings().enabled) return;
   state.generationLifecycleActive = false;
+  state.replacementTarget = null;
   state.generationEndedAt = Date.now();
   if (state.streamProbeTimer) clearTimeout(state.streamProbeTimer);
   state.streamProbeTimer = null;
   invalidateRuntimeCaches('generation finished');
   const row = observeLatestAssistantRow(true);
+  syncGodlogsWithChat(source);
   // SillyTavern has explicitly told us visible generation is over. Mark this exact body hash final,
   // then start the summary after only a tiny commit grace instead of the generic 1800ms source debounce.
   markRowFinalizedForGodlog(row);
@@ -10414,11 +10551,11 @@ function godlogStatusLabel(status, item = null) {
   if (item?.retryScheduledAt && item.retryScheduledAt > Date.now()) return '自动重试中';
   if (status === 'ready') {
     if (item?.key && isSummaryRowBusy(item.key)) return '重跑中';
-    return item?.sourceMismatch || item?.rerunError ? '已保存' : '已完成';
+    return item?.sourceMismatch ? '已失效' : (item?.rerunError ? '有效·重跑失败' : '有效');
   }
   if (status === 'missing') return '待自动补写';
   if (status === 'failed') return '待补写';
-  if (status === 'stale') return '待刷新';
+  if (status === 'stale') return '已失效·待刷新';
   if (status === 'orphaned') return '孤儿';
   if (status === 'pending') {
     if (item?.key && isSummaryRowBusy(item.key)) return '生成中';
@@ -10517,7 +10654,7 @@ function messageGodlogBody(item, row) {
   if (item.body) {
     const notices = [];
     if (item.status === 'stale' || item.stale) {
-      notices.push('【旧摘要暂存；当前楼稳定后将自动更新】');
+      notices.push('【已失效：旧摘要仅供核对，不发送给AI；当前楼稳定后自动更新】');
     } else {
       if (item.rerunQueued) {
         notices.push('【手动重跑已排队；正文稳定后会自动开始，旧摘要继续生效。】');
@@ -10530,7 +10667,7 @@ function messageGodlogBody(item, row) {
         notices.push(`【上次手动重跑失败：${item.rerunError}；旧摘要仍然保留。】`);
       }
       if (item.sourceMismatch) {
-        notices.push('【摘要已保存并锁定；该楼后来发生了注入、渲染或正文变化，插件不会自动重跑。如需按当前正文更新，请手动点“重跑本楼摘要”。】');
+        notices.push('【当前回复已换版；旧摘要不参与记忆，正文稳定后会自动更新。】');
       }
     }
     const prefix = notices.length > 0 ? `${notices.join('\n')}\n` : '';
@@ -11614,6 +11751,7 @@ function transferMergeSnapshot(merge, archivedCoverageCount = 0) {
     number: 1,
     body,
     sourceKeys: [],
+    sourceRevisions: {},
     cycleSourceKeys: [],
     sourceAnchorIds: [],
     sourceGodlogIds: [],
@@ -13444,6 +13582,7 @@ function onChatChanged() {
   state.latestRowKey = '';
   state.latestRowHash = '';
   state.latestRowChangedAt = 0;
+  state.replacementTarget = null;
   state.generationLifecycleActive = false;
   state.generationStartedAt = 0;
   state.generationEndedAt = 0;
@@ -13475,6 +13614,9 @@ function onChatChanged() {
 function onChatMutated(reason) {
   if (!settings().enabled) return;
   invalidateRuntimeCaches(reason || 'chat mutated');
+  clearRecallPrefetch();
+  syncGodlogsWithChat(reason);
+  clearInjectedPromptState();
   // Swipe/edit/delete events can fire before SillyTavern has committed the new message object.
   // Debounce to the next settled state so the old summary is removed from metadata and UI reliably.
   if (state.mutationTimer) clearTimeout(state.mutationTimer);
@@ -13497,6 +13639,8 @@ window.anchorMemory_onGenerate = async (chat, contextSize, abort, type) => {
     if (Array.isArray(chat)) removeExistingAnchorMemoryPrompt(chat);
     return;
   }
+  prepareReplacementGeneration(type);
+  syncGodlogsWithChat('生成请求前核对');
   const operationEpoch = state.contextEpoch;
   const cancelIfPaused = () => {
     if (settings().enabled && operationEpoch === state.contextEpoch) return false;

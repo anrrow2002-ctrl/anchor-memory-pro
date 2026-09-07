@@ -29,7 +29,7 @@
         <button class="am-tab" data-tab="settings">设置 / API</button>
         <button id="am_toggle_advanced_tabs" class="am-tab am-more-tab" type="button" aria-expanded="false">更多功能</button>
         <button class="am-tab am-advanced-tab" data-tab="prompts">提示词</button>
-        <button class="am-tab am-advanced-tab" data-tab="summaries">逐楼摘要</button>
+        <button class="am-tab" data-tab="summaries">逐楼摘要</button>
         <button class="am-tab am-advanced-tab" data-tab="scenes">场景</button>
         <button class="am-tab am-advanced-tab" data-tab="tools">工具</button>
       </div>
@@ -83,7 +83,7 @@
           <input id="am_godlog_search" class="text_pole" type="text" placeholder="搜索逐楼摘要、人物、地点、原话..." />
           <button id="am_generate_missing_godlogs">自动补写缺失摘要</button>
         </div>
-        <div class="am-note">缺失摘要会自动重试；如果某楼失败或落后，点“自动补写缺失摘要”或卡片里的“重跑本楼摘要”，插件会调用模型补写，不需要手写。</div>
+        <div class="am-note">摘要跟随当前选中的回复版本。重生成、切换回复或编辑正文后，旧摘要及依赖记忆立即失效；生成完成后自动更新。每楼缓存最近8个有效摘要版本，切回相同正文时可复用。失效内容仅供核对，不发送给AI。缺失摘要会自动重试；如果某楼失败或落后，点“自动补写缺失摘要”或卡片里的“重跑本楼摘要”，插件会调用模型补写，不需要手写。</div>
         <div id="am_godlog_list" class="am-card-list"></div>
         <label>选中摘要
           <textarea id="am_godlog_detail" class="am-preview text_pole"></textarea>
