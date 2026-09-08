@@ -201,13 +201,13 @@ export function fitMemorySections(sections, totalTokens) {
     weight: Math.max(0.1, Number(section.weight) || 1),
   }));
   const dividerCost = estimateTextTokens('\n\n') * Math.max(0, requested.length - 1);
-  let available = Math.max(200, total - dividerCost);
+  let available = Math.max(0, total - dividerCost);
   const allocations = requested.map(section => Math.min(section.originalTokens, section.minTokens, section.maxTokens));
   let used = allocations.reduce((sum, value) => sum + value, 0);
 
   if (used > available) {
     const scale = available / used;
-    for (let i = 0; i < allocations.length; i++) allocations[i] = Math.max(30, Math.floor(allocations[i] * scale));
+    for (let i = 0; i < allocations.length; i++) allocations[i] = Math.max(0, Math.floor(allocations[i] * scale));
     used = allocations.reduce((sum, value) => sum + value, 0);
   }
 
@@ -222,7 +222,7 @@ export function fitMemorySections(sections, totalTokens) {
     for (const { section, index } of eligible) {
       const capacity = Math.min(section.originalTokens, section.maxTokens) - allocations[index];
       const share = Math.max(1, Math.floor(remaining * (section.weight / totalWeight)));
-      const add = Math.min(capacity, share);
+      const add = Math.max(0, Math.min(capacity, share, remaining - granted));
       allocations[index] += add;
       granted += add;
     }
@@ -231,7 +231,8 @@ export function fitMemorySections(sections, totalTokens) {
   }
 
   const rendered = requested.map((section, index) => {
-    const text = clampTextByTokens(
+    const fitter = typeof section.fitText === 'function' ? section.fitText : clampTextByTokens;
+    const text = fitter(
       section.text,
       allocations[index],
       section.headRatio ?? 0.34,

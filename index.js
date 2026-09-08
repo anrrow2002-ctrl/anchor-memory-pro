@@ -15,6 +15,7 @@ import {
   resolveAdaptiveMemoryBudget,
   fitMemorySections,
 } from './core/runtime-controls.js';
+import { extractNarrativeSource, maskNarrativeSource, narrativeText, isConcreteRecallName, fitMemoryText, conciseMemory, dedupeMemorySections } from './core/memory-presentation.js';
 import { rebuildTimelineState } from './core/time-engine.js';
 import {
   entityKey,
@@ -158,7 +159,7 @@ function isGenerationActive() {
 
 
 const MODULE = 'anchor_memory';
-const EXTENSION_VERSION = '1.1.3-rp.1';
+const EXTENSION_VERSION = '1.1.4-rp.2';
 const DATA_KEY = 'anchorMemory';
 const CORE_PROMPT_KEY = 'anchor_memory_core';
 const RECALL_PROMPT_KEY = 'anchor_memory_recall';
@@ -171,8 +172,8 @@ const VECTOR_STORE_NAME = 'vectors';
 const MESSAGE_RENDER_MARGIN_PX = 1400;
 const MESSAGE_RENDER_RECENT_COUNT = 16;
 const SOURCE_HASH_SCHEMA_VERSION = 4;
-const GODLOG_BLOCK_RE = /\s*(?:```[a-zA-Z0-9_-]*\s*)?<Godlog>[\s\S]*?<\/Godlog>(?:\s*```)?\s*/gi;
-const GODLOG_ESCAPED_BLOCK_RE = /\s*&lt;Godlog&gt;[\s\S]*?&lt;\/Godlog&gt;\s*/gi;
+const GODLOG_BLOCK_RE = /\s*(?:```[a-zA-Z0-9_-]*\s*)?<(?:abstract|Godlog)>[\s\S]*?<\/(?:abstract|Godlog)>(?:\s*```)?\s*/gi;
+const GODLOG_ESCAPED_BLOCK_RE = /\s*&lt;(?:abstract|Godlog)&gt;[\s\S]*?&lt;\/(?:abstract|Godlog)&gt;\s*/gi;
 const GODLOG_FIELD_XML_GROUP_RE = /\s*(?:(?:<|&lt;)(?:Nub|Title|Time|Pln|Per|Cond)(?:>|&gt;)[\s\S]*?(?:<|&lt;)\/(?:Nub|Title|Time|Pln|Per|Cond)(?:>|&gt;)\s*){3,}/gi;
 const FENCED_CODE_BLOCK_RE = /\s*```[a-zA-Z0-9_-]*\s*[\s\S]*?```\s*/g;
 const GODLOG_FIELD_NAMES = ['Nub', 'Title', 'Time', 'Pln', 'Per', 'Cond'];
@@ -221,7 +222,7 @@ function normalizeMergeAnchorInterval(value) {
   return Math.max(2, Math.min(20, Math.round(Number(value) || DEFAULT_MERGE_ANCHOR_INTERVAL)));
 }
 
-const DEFAULT_GODLOG_RULES = `你是长篇角色扮演的逐回合记忆记录员。你只总结“当前回合”：通常由紧邻的用户输入与随后的 AI 回复组成；若当前是首条 AI 开场楼，则只总结该 AI 回复。Godlog 仅供插件后台使用，禁止写入可见聊天正文，禁止使用 Markdown 代码块。
+const DEFAULT_GODLOG_RULES = `你是长篇角色扮演的逐回合记忆记录员。你只总结“当前回合”：通常由紧邻的用户输入与随后的 AI 回复组成；若当前是首条 AI 开场楼，则只总结该 AI 回复。abstract 仅供插件后台使用，禁止写入可见聊天正文，禁止使用 Markdown 代码块。
 
 内容规则：
 - 只记录当前回合新增、已经发生且能由原文确认的剧情事实。角色卡、世界书和上文摘要只用于确认姓名、身份、关系与语境，禁止把其中旧事件重新写进本楼。
@@ -234,17 +235,17 @@ const DEFAULT_GODLOG_RULES = `你是长篇角色扮演的逐回合记忆记录�
 - Pln 填写本回合主要发生地点；发生明确转场时按先后写“地点A → 地点B”；无法判断写“未明”。
 - Per 只列本回合实际出现或被明确提及的人物姓名/称谓，去重后用中文逗号分隔；不要写人物介绍、关系说明或代词。
 - Title 用 8—18 个汉字概括本回合最核心事件，不使用“本楼摘要、剧情推进、日常互动”等空标题。
-- Cond 写 200—350 个汉字的高密度叙事摘要。必须让未在场的读者仅凭此段就能理解本回合发生了什么，同时禁止扩写、润色原文之外的细节、预测后续或评价角色。
+- Cond 用不超过350字记录新增事实；短回合可以很短，不为凑字数复述或补写。必须让未在场的读者仅凭此段就能理解本回合发生了什么，同时禁止扩写、润色原文之外的细节、预测后续或评价角色。
 
 输出必须严格为一个完整 XML 块。六个字段缺一不可，不要添加任何前言、解释、尾注、HTML 或代码块：
-<Godlog>
+<abstract>
 <Nub>照抄任务中提供的轮次序号</Nub>
 <Title>8—18字小标题</Title>
 <Time>剧情内时间，写清楚年月日准确时间；无法判断写“未明”</Time>
 <Pln>主要地点；转场用“地点A → 地点B”；无法判断写“未明”</Pln>
 <Per>本回合出现或被明确提及的人物姓名/称谓，去重后用中文逗号分隔</Per>
-<Cond>200—350字高密度叙事摘要；按因果与时间顺序写清动作、转折、结果和关键原话，不得脑补</Cond>
-</Godlog>`;
+<Cond>按实际信息量写简洁摘要，最多350字；按因果与时间顺序写清动作、转折、结果和关键原话，不得脑补</Cond>
+</abstract>`;
 
 const DEFAULT_ANCHOR_RULES = `锚点规则：
 - 本锚点只总结本批新增的逐楼摘要，不复述旧锚点，不附加人物表、物品表或场景表。
@@ -280,14 +281,14 @@ const DEFAULT_ITEM_RULES = `物品、细节与内部梗规则：
 - 同一物品的简称、全称或轻微写法变化必须合并为同一行，禁止重复建项。
 - 不写未发生的用途，不替模型预测未来。`;
 
-const GODLOG_FORMAT_HELP = `<Godlog>
+const GODLOG_FORMAT_HELP = `<abstract>
 <Nub>照抄任务中提供的轮次序号</Nub>
 <Title>8—18字小标题</Title>
 <Time>剧情内时间，写清楚年月日准确时间；无法判断写“未明”</Time>
 <Pln>主要地点；转场用“地点A → 地点B”；无法判断写“未明”</Pln>
 <Per>本回合出现或被明确提及的人物姓名/称谓，去重后用中文逗号分隔</Per>
-<Cond>200—350字高密度叙事摘要；按因果与时间顺序写清动作、转折、结果和关键原话，不得脑补</Cond>
-</Godlog>`;
+<Cond>按实际信息量写简洁摘要，最多350字；按因果与时间顺序写清动作、转折、结果和关键原话，不得脑补</Cond>
+</abstract>`;
 
 const LEGACY_MERGE_RULES_099 = `全量合并规则：
 - 将上一次历史锚点与本周期全部新增记忆合并为一份新的累计历史锚点。
@@ -322,6 +323,8 @@ const MERGE_FORMAT_HELP = `### 第 X 次全量合并锚点
 
 const DEFAULT_SETTINGS = {
   settingsVersion: EXTENSION_VERSION,
+  narrativeTags: "auto",
+  narrativeCustomTags: "",
   enabled: true,
   anchorInterval: DEFAULT_ANCHOR_INTERVAL,
   mergeAnchorInterval: DEFAULT_MERGE_ANCHOR_INTERVAL,
@@ -521,6 +524,10 @@ function settings() {
     delete s.mergeInterval;
     changed = true;
   }
+  if (/<\/?Godlog>/i.test(s.godlogRules || '')) {
+    s.godlogRules = s.godlogRules.replace(/<(\/?)Godlog>/gi, '<$1abstract>');
+    changed = true;
+  }
   if (looksLikeLegacyGodlogRules(s.godlogRules)) {
     s.godlogRules = DEFAULT_GODLOG_RULES;
     changed = true;
@@ -529,7 +536,7 @@ function settings() {
     s.godlogRules = DEFAULT_GODLOG_RULES;
     changed = true;
   }
-  // Upgrade stock historical Godlog prompts, but leave genuinely customized prompts untouched.
+  // Upgrade stock historical abstract prompts, but leave genuinely customized prompts untouched.
   if (/200-350字文学摘要，必须包含剧情推进、动作、关键对话原话、心理转折；需要仔细梳理清楚本回合的详细经过/.test(String(s.godlogRules || ''))
       || (String(s.godlogRules || '').includes('你是长篇角色扮演的逐回合记忆记录员。你只总结“当前回合”')
         && String(s.godlogRules || '').includes('<Time>剧情内时间；无法判断写“未明”</Time>')
@@ -1517,7 +1524,7 @@ function memoryData() {
 
   // v1.1.2: repair the infinite-rerun state created by v1.1.0/v1.1.1. Those builds kept
   // post-processing (hide/codex/vector indexing) inside the summary writer transaction. A valid
-  // Godlog could therefore be committed, then demoted back to pending when a later indexing step
+  // abstract could therefore be committed, then demoted back to pending when a later indexing step
   // failed. Restore any structurally complete stored body as a durable ready snapshot; post-process
   // work is rebuilt independently and must never spend another summary API request.
   if (priorDataVersion > 0 && priorDataVersion < 15) {
@@ -2205,8 +2212,7 @@ function collectWorldCanon(row, godlog = null, ctx = getContext()) {
     ctx.name1,
     ctx.name2,
     row?.name,
-    row?.turnText,
-    row?.text,
+    memorySourceForRow(row),
     safeGodlogMemoryText(godlog?.body || ''),
   ].filter(Boolean).join('\n');
   const terms = keywordSet(query);
@@ -2244,6 +2250,28 @@ function collectWorldCanon(row, godlog = null, ctx = getContext()) {
   return uniqueCompactLines(rows.sort((a, b) => b.score - a.score).map(item => item.text), 18);
 }
 
+function selectedNarrativeTags() {
+  const s = settings();
+  if (s.narrativeTags === 'plain') return null;
+  if (s.narrativeTags === 'custom') return String(s.narrativeCustomTags || '').split(/[\s,，]+/).map(x => x.replace(/[<>/]/g, '')).filter(Boolean);
+  if (['context', 'content'].includes(s.narrativeTags)) return [s.narrativeTags];
+  return ['context', 'content'];
+}
+function narrativeSourceSignature() { return JSON.stringify(selectedNarrativeTags()); }
+function memorySourceForRow(row, masked = false) {
+  if (selectedNarrativeTags() !== null && row?.text && !narrativeText(extractNarrativeSource(row.text, selectedNarrativeTags()))) return '';
+  const text = extractNarrativeSource(row?.turnText || row?.text || '', selectedNarrativeTags());
+  return masked ? text : narrativeText(text);
+}
+function refreshSourcePreview() {
+  const messages = getContext().chat || [];
+  const latest = [...messages].reverse().find(m => m && !m.is_user && !m.is_system && !m.is_hidden);
+  const text = narrativeText(extractNarrativeSource(latest?.mes || '', selectedNarrativeTags()));
+  $('#am_source_preview').val(text);
+  $('#am_source_status').text(text ? `提取到 ${text.length} 字正文` : '未找到正文：请检查标签名称与回复内容。');
+  $('#am_source_custom_wrap').toggle(settings().narrativeTags === 'custom');
+}
+
 function collectRecentOriginalContext(row, limit = 8) {
   const chat = getContext().chat || [];
   const end = Number.isInteger(row?.index) ? row.index : chat.length;
@@ -2253,7 +2281,8 @@ function collectRecentOriginalContext(row, limit = 8) {
     .map((message, offset) => {
       const floor = Math.max(0, end - limit) + offset + 1;
       const role = message.is_user ? '用户' : 'AI';
-      return `第${floor}楼 ${role} ${message.name || '未命名'}：${clampText(cleanText(message.mes), 500)}`;
+      const body = narrativeText(message.is_user ? message.mes : extractNarrativeSource(message.mes, selectedNarrativeTags()));
+      return body ? `第${floor}楼 ${role} ${message.name || '未命名'}：${conciseMemory(body, 500)}` : '';
     })
     .filter(Boolean);
 }
@@ -2315,7 +2344,7 @@ function hasGodlogColonFields(text) {
 
 function looksLikeGodlogLeakText(text) {
   const value = String(text || '');
-  return /(?:<|&lt;)\/?Godlog(?:>|&gt;)/i.test(value)
+  return /(?:<|&lt;)\/?abstract(?:>|&gt;)/i.test(value)
     || hasGodlogColonFields(value)
     || hasGodlogXmlFields(value);
 }
@@ -2373,14 +2402,14 @@ function stripGodlogBlocks(text) {
 }
 
 function sanitizeMainPromptMemoryText(text) {
-  return renderMacros(stripGodlogBlocks(text)
+  return renderMacros(narrativeText(stripGodlogBlocks(text))
     .replace(/<script[\s\S]*?<\/script>/gi, '')
     .replace(/Anchor Memory｜旧楼层索引摘要/gi, '剧情资料｜旧楼摘要')
     .replace(/Anchor Memory｜旧楼层正文已隐藏/gi, '剧情资料｜旧楼正文已隐藏')
     .replace(/Anchor Memory｜旧用户输入已隐藏/gi, '剧情资料｜旧用户输入已隐藏')
     .replace(/\bAnchor Memory\b/gi, '剧情资料')
-    .replace(/&lt;\/?(?:Godlog|Nub|Title|Time|Pln|Per|Cond)&gt;/gi, ' ')
-    .replace(/<\/?(?:Godlog|Nub|Title|Time|Pln|Per|Cond)>/gi, ' ')
+    .replace(/&lt;\/?(?:abstract|Nub|Title|Time|Pln|Per|Cond)&gt;/gi, ' ')
+    .replace(/<\/?(?:abstract|Nub|Title|Time|Pln|Per|Cond)>/gi, ' ')
     .replace(/\bGodlog\b/gi, '逐楼摘要')
     .replace(/(?:^|\n)\s*(?:Nub|Title|Time|Pln|Per|Cond)\s*[:：]\s*/gi, '\n')
     .replace(/\n{3,}/g, '\n\n')
@@ -2445,8 +2474,8 @@ function hasGodlogFenceBlock(text) {
 
 function hasGodlogBlock(text) {
   const value = String(text || '');
-  return /<Godlog>[\s\S]*?<\/Godlog>/i.test(value)
-    || /&lt;Godlog&gt;[\s\S]*?&lt;\/Godlog&gt;/i.test(value)
+  return /<abstract>[\s\S]*?<\/abstract>/i.test(value)
+    || /&lt;abstract&gt;[\s\S]*?&lt;\/abstract&gt;/i.test(value)
     || hasGodlogFenceBlock(value)
     || hasGodlogXmlFields(value);
 }
@@ -2483,17 +2512,17 @@ function cleanupUserGodlogBlocks() {
 }
 
 function normalizeGodlogBlock(body) {
-  const raw = String(body || '').trim();
+  const raw = String(body || '').replace(/<(\/?)Godlog>/gi, '<$1abstract>').trim();
   if (!raw) return '';
   // Some OpenAI-compatible proxies return XML as escaped text. Decode only the structural entities
-  // used by Godlog so a valid response is not mistaken for an empty/short summary.
+  // used by abstract so a valid response is not mistaken for an empty/short summary.
   const text = raw
     .replace(/&lt;/gi, '<')
     .replace(/&gt;/gi, '>')
     .replace(/&quot;/gi, '"')
     .replace(/&#39;|&apos;/gi, "'")
     .trim();
-  const match = text.match(/<Godlog>[\s\S]*?<\/Godlog>/i);
+  const match = text.match(/<abstract>[\s\S]*?<\/abstract>/i);
   if (match) {
     const block = match[0].trim();
     if (/<Nub>[\s\S]*?<\/Nub>/i.test(block)) return block;
@@ -2502,7 +2531,7 @@ function normalizeGodlogBlock(body) {
   }
   const converted = normalizeLegacyGodlogFields(text);
   if (converted) return converted;
-  return `<Godlog>\n${text}\n</Godlog>`;
+  return `<abstract>\n${text}\n</abstract>`;
 }
 
 function compactCharacterCount(text) {
@@ -2510,12 +2539,7 @@ function compactCharacterCount(text) {
 }
 
 function expectedGodlogCondMin(row) {
-  const sourceChars = compactCharacterCount(row?.turnText || row?.text || '');
-  // Long role-play turns must honor the configured 200-character lower bound. Very short turns use
-  // a proportional floor so the validator never pressures the writer to invent details merely to pad.
-  if (sourceChars >= 400) return 200;
-  if (sourceChars >= 240) return 150;
-  return Math.max(60, Math.min(130, Math.floor(sourceChars * 0.62) || 60));
+  return 1; // Completeness is factual, never a reason to pad a short turn with inventions.
 }
 
 function validateGodlogCandidate(body, row) {
@@ -2554,9 +2578,9 @@ function buildGodlogCorrectionPrompt(basePrompt, failedBody, validation) {
 上一次输出：
 ${clampText(String(failedBody || '（空）'), 1800)}
 
-请重新阅读“当前回合原文”，从头输出一个完整的 <Godlog> XML 块，不要续写上一次答案，不要解释。
+请重新阅读“当前回合原文”，从头输出一个完整的 <abstract> XML 块，不要续写上一次答案，不要解释。
 - 六个字段必须全部存在。
-- Cond 必须不少于 ${validation?.minCondChars || 200} 字；当前楼原文足够长时应保持 200—350 字。
+- Cond 必须包含实际新增事实；短回合可用一句，不强求字数，最长350字。
 - 只能增加原文中已经发生的动作、转折、结果和关键原话，禁止用空话凑字数，禁止脑补。`;
 }
 
@@ -2569,13 +2593,13 @@ function legacyGodlogFieldValue(text, field) {
 
 function normalizeLegacyGodlogFields(text) {
   const inner = String(text || '')
-    .replace(/^\s*<Godlog>\s*/i, '')
-    .replace(/\s*<\/Godlog>\s*$/i, '')
+    .replace(/^\s*<abstract>\s*/i, '')
+    .replace(/\s*<\/abstract>\s*$/i, '')
     .trim();
   if (!/(?:^|\n)\s*Nub\s*[:：]/i.test(inner)) return '';
   const values = GODLOG_FIELD_NAMES.map(field => [field, legacyGodlogFieldValue(inner, field)]);
   if (values.filter(([, value]) => value).length < 3) return '';
-  return `<Godlog>\n${values.map(([field, value]) => `<${field}>${value || '未明'}</${field}>`).join('\n')}\n</Godlog>`;
+  return `<abstract>\n${values.map(([field, value]) => `<${field}>${value || '未明'}</${field}>`).join('\n')}\n</abstract>`;
 }
 
 function replaceGodlogField(block, tag, value) {
@@ -2584,7 +2608,7 @@ function replaceGodlogField(block, tag, value) {
   if (!text || !safeValue) return text;
   const pattern = new RegExp(`<${tag}>[\\s\\S]*?<\\/${tag}>`, 'i');
   if (pattern.test(text)) return text.replace(pattern, `<${tag}>${safeValue}</${tag}>`);
-  return text.replace(/<\/Godlog>\s*$/i, `<${tag}>${safeValue}</${tag}>\n</Godlog>`);
+  return text.replace(/<\/abstract>\s*$/i, `<${tag}>${safeValue}</${tag}>\n</abstract>`);
 }
 
 function plainGodlogText(body) {
@@ -2597,7 +2621,7 @@ function plainGodlogText(body) {
     return value ? `${tag}: ${value}` : '';
   }).filter(Boolean);
   if (fields.length > 0) return fields.join('\n');
-  return block.replace(/<\/?Godlog>/gi, '').replace(/<\/?[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+  return block.replace(/<\/?abstract>/gi, '').replace(/<\/?[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
 function safeGodlogMemoryText(body) {
@@ -2623,8 +2647,8 @@ function compactGodlogMemoryText(body, maxChars = 260) {
   const prefix = `${locator ? `[${locator}] ` : ''}${title}：`;
   const budget = Math.max(120, Number(maxChars) || 260);
   const bodyBudget = Math.max(60, budget - prefix.length);
-  const compact = `${prefix}${clampTextHeadTail(content, bodyBudget, 0.42)}`;
-  return clampTextHeadTail(sanitizeMainPromptMemoryText(compact), budget, 0.42);
+  const compact = conciseMemory(content, bodyBudget);
+  return compact ? `${prefix}${compact}` : conciseMemory(content, budget);
 }
 
 function safePromptMemoryText(kind, item, limit = 1800) {
@@ -2636,7 +2660,7 @@ function safePromptMemoryText(kind, item, limit = 1800) {
       .replace(/^\s*>?\s*(?:\uD83D\uDCD6\s*)?(?:场景|剧情|逐楼)?摘要\s*[：:·].*$/gm, '')
       .replace(/^\s*[-*]?\s*(?:场景|剧情|逐楼)?摘要\s*[：:·].*$/gm, '')
       .trim();
-  return clampText(sanitizeMainPromptMemoryText(text), limit);
+  return conciseMemory(sanitizeMainPromptMemoryText(text), limit);
 }
 
 function safeCodexText(text, limit = 2200) {
@@ -2996,7 +3020,7 @@ function anchorMaterialForRow(data, row, rows = chatRows(true)) {
   if (isGodlogReady(godlog, row)) return { row, godlog, mode: 'godlog' };
   // A failed/pending summary must not permanently freeze every later 15-turn anchor. Keep the
   // strict chronological boundary, but once the floor has left the recent raw window, use its
-  // authoritative turn text as a bounded emergency material. The normal Godlog remains pending.
+  // authoritative turn text as a bounded emergency material. The normal abstract remains pending.
   if (rawFallbackEligible(row, rows)) {
     return { row, godlog: null, mode: 'raw-fallback', fallbackText: rawFallbackTextForRow(row, 8000) };
   }
@@ -3173,7 +3197,7 @@ function maybeWarnMissingGodlogs(data = memoryData()) {
   const currentSettings = settings();
   const message = `${floors}${suffix} 没有生成逐楼摘要。${retryText}该楼仍会保持待补写状态；若它离开最近原文窗口，插件会临时注入受限保底原文，并允许后续锚点继续推进，避免一楼失败拖出整段记忆断层。`;
 
-  console.warn('[AnchorMemory] missing Godlog rows detected:', issues.map(({ row, item }) => ({
+  console.warn('[AnchorMemory] missing abstract rows detected:', issues.map(({ row, item }) => ({
     floor: row.index,
     status: item?.status || 'missing',
     error: item?.error || '',
@@ -3192,9 +3216,9 @@ function maybeWarnMissingGodlogs(data = memoryData()) {
 
 function rawFallbackTextForRow(row, maxChars = 1800) {
   if (isReplacementSource(row)) return '';
-  const source = sanitizeMainPromptMemoryText(row?.turnText || row?.text || '');
+  const source = sanitizeMainPromptMemoryText(memorySourceForRow(row));
   if (!source) return '';
-  return clampTextHeadTail(source, Math.max(320, Number(maxChars) || 1800), 0.38);
+  return conciseMemory(source, Math.max(320, Number(maxChars) || 1800));
 }
 
 function rawFallbackEligible(row, rows = chatRows(true)) {
@@ -3693,7 +3717,8 @@ function ensureEntityState(data) {
 }
 
 function itemEventSourceSnippet(row, itemName, maxTokens = 180) {
-  const source = String(row?.turnText || row?.text || '');
+  if (!isConcreteRecallName(itemName)) return '';
+  const source = memorySourceForRow(row);
   if (!source) return '';
   const lower = source.toLocaleLowerCase();
   const candidates = [String(itemName || '').trim(), ...itemAliasTokens(itemName)]
@@ -3712,12 +3737,12 @@ function itemEventSourceSnippet(row, itemName, maxTokens = 180) {
   const radius = Math.max(260, Math.min(900, Math.round(maxTokens * 2.4)));
   const start = Math.max(0, index - Math.floor(radius * 0.42));
   const end = Math.min(source.length, index + Math.max(matched.length, 1) + Math.floor(radius * 0.58));
-  return clampTextByTokens(source.slice(start, end).trim(), maxTokens, 0.5, '…（同楼细节省略）…');
+  return fitMemoryText(source.slice(start, end).trim(), maxTokens);
 }
 
 function buildItemEventForRow(data, item, row) {
-  if (!item?.name || !row?.key) return null;
-  const rawText = String(row.turnText || row.text || '');
+  if (!isConcreteRecallName(item?.name) || !row?.key || isReplacementSource(row)) return null;
+  const rawText = memorySourceForRow(row);
   const godlog = godlogForRow(data, row);
   const godlogText = isGodlogReady(godlog, row) ? safeGodlogMemoryText(godlog.body || '') : '';
   const aliases = itemAliasTokens(item.name);
@@ -4441,7 +4466,7 @@ async function callSummaryWriter(prompt, maxTokens = 1000, options = {}) {
     throw new Error('逐楼摘要需要先配置并启用副API');
   }
   return callSecondary([
-    { role: 'system', content: 'You are a precise Godlog narrative summarizer. Return only the requested XML fields for the background task. Never use Markdown code fences and never write content intended for the visible chat reply.' },
+    { role: 'system', content: 'You are a precise abstract narrative summarizer. Return only the requested XML fields for the background task. Never use Markdown code fences and never write content intended for the visible chat reply.' },
     { role: 'user', content: prompt },
   ], maxTokens, options);
 }
@@ -4461,7 +4486,9 @@ function buildGodlogPrompt(data, row, item = null) {
 
   return `${renderTemplate(settings().godlogRules || DEFAULT_GODLOG_RULES)}
 
-请只为当前回合写 Godlog。通常当前回合 = 用户输入 + 随后的AI回复；如果没有用户输入，则当前回合 = 这条AI开场/AI回复本身。Godlog 只返回给本次后台摘要任务，插件会单独渲染静态摘要卡；不要把 Godlog 写回 AI 回复正文，不要使用 Markdown 代码块，不要总结其他回合，不要输出HTML标签。
+记录有后续影响的行动、信息、承诺和状态变化。同一连续场景内的重复动作压成一句；不写气氛修辞、写作分析和检查清单。不要把角色内心设想的信或未执行选项写成已经完成的行动。
+
+请只为当前回合写 abstract。通常当前回合 = 用户输入 + 随后的AI回复；如果没有用户输入，则当前回合 = 这条AI开场/AI回复本身。abstract 只返回给本次后台摘要任务，插件会单独渲染静态摘要卡；不要把 abstract 写回 AI 回复正文，不要使用 Markdown 代码块，不要总结其他回合，不要输出HTML标签。
 
 跑团事实边界：
 - 必须区分已发生、尝试/计划、角色推测、传闻、梦境/回忆与明确否定；保留这些限定词。
@@ -4494,7 +4521,7 @@ Name: ${row.name || '未命名'}
 SendDate: ${row.sendDate || '未记录'}
 
 ## 当前回合原文（唯一剧情事实来源）
-${row.turnText || row.text}`;
+${memorySourceForRow(row)}`;
 }
 
 function buildCodexPatchPrompt(data, row, godlog) {
@@ -4586,7 +4613,7 @@ ${data.codex.sceneIndex || '（暂无）'}
 
 ## 当前楼层事实
 第 ${floor} 楼 / ${row.name || '未命名'}
-${currentFacts || cleanText(row.turnText || row.text)}`;
+${currentFacts || memorySourceForRow(row)}`;
 }
 
 async function updateCodexFromGodlog(data, row, godlog, force = false) {
@@ -4904,7 +4931,7 @@ function buildAnchorPrompt(data, materials) {
   const start = rows[0]?.assistantNumber || rows[0]?.index + 1 || 0;
   const end = rows[rows.length - 1]?.assistantNumber || rows[rows.length - 1]?.index + 1 || 0;
 
-  return `你是长篇角色扮演的后台锚点整理员。请只把下面这一批新增记忆材料压缩成一个独立锚点。绝大多数材料是逐楼摘要；若个别楼层标记为“保底原文”，它是摘要失败后的唯一事实来源，必须按原文提取且不得补写。
+  return `你是长篇角色扮演的后台锚点整理员。按事件而非楼层整理：连续场景合并成完整事件链，保留起因、重要行动、结果和未解决事项；重复动作、气氛修辞和无后果细节不逐项重述。不要为凑篇幅发明象征意义。请只把下面这一批新增记忆材料压缩成一个独立锚点。绝大多数材料是逐楼摘要；若个别楼层标记为“保底原文”，它是摘要失败后的唯一事实来源，必须按原文提取且不得补写。
 
 ${renderTemplate(s.anchorRules || DEFAULT_ANCHOR_RULES)}
 
@@ -5349,7 +5376,7 @@ async function rewriteSelectedMemory() {
 function recentNarrativeQuery(chat = getContext().chat || [], limit = 6) {
   return (Array.isArray(chat) ? chat : [])
     .filter(message => message && isNarrativeMessage(message))
-    .map(message => outboundMessageText(message))
+    .map(message => recallQueryMessageText(message))
     .filter(Boolean)
     .slice(-Math.max(1, Number(limit) || 6))
     .join('\n');
@@ -5438,24 +5465,15 @@ function relationshipInjectionBlock(data, maxChars = RELATIONSHIP_MEMORY_CHAR_BU
 
 function anchorEventInjectionBlock(data, charScale = 1) {
   const parts = [];
-  const anchorInterval = normalizeAnchorInterval(settings().anchorInterval);
-  const mergeAnchorInterval = normalizeMergeAnchorInterval(settings().mergeAnchorInterval);
   const merge = latestMerge(data);
-  parts.push(`**1. 历史锚点简述（每 ${mergeAnchorInterval} 个分段锚点累计合并一次）：**`);
-  parts.push(merge
-    ? safePromptMemoryText('merge', merge, Math.round(7600 * charScale))
-    : `（尚未累计到 ${mergeAnchorInterval} 个分段锚点，暂无累计历史锚点）`);
-  parts.push(`**2. 本次新增锚点（每 ${anchorInterval} 个有效AI回合）：**`);
-  const anchors = activeAnchorsAfterMerge(data);
-  if (anchors.length === 0) parts.push(`（暂无尚未并入累计历史的 ${anchorInterval} 回合锚点）`);
-  else {
-    for (const anchor of anchors) {
-      // normalizeAnchorBody() already includes the numbered heading. Do not add a second duplicate heading.
-      parts.push(safePromptMemoryText('anchor', anchor, Math.round(2600 * charScale)));
-    }
+  if (merge) parts.push(`### 累计历史\n${safePromptMemoryText('merge', merge, Math.round(7600 * charScale))}`);
+  for (const anchor of activeAnchorsAfterMerge(data)) {
+    const rows = (anchor.sourceKeys || []).map(rowByStableKey).filter(Boolean);
+    const range = rows.length ? ` · 回合${rows[0].assistantNumber}—${rows.at(-1).assistantNumber}` : '';
+    const body = safePromptMemoryText('anchor', anchor, Math.round(2600 * charScale))
+      .replace(/^###.*$/gm, '').replace(/^\*\*本次新增锚点[：:]\*\*$/gm, '').trim();
+    if (body) parts.push(`### 分段${anchor.number}${range}\n${body}`);
   }
-  // Do not pre-trim the combined anchor block here. fitMemorySections() owns the final token
-  // budget, so a second head/tail trim would silently delete a different middle slice twice.
   return parts.join('\n\n');
 }
 
@@ -5552,19 +5570,42 @@ function itemEventTimelineInjectionBlock(data, chat, maxEventsPerItem = 12) {
 }
 
 function importantItemsInjectionBlock(data, chat, codexOverride = undefined) {
-  if (!settings().injectImportantItems) return '（重要物品表注入未启用）';
+  if (!settings().injectImportantItems) return '';
   const codex = codexOverride === undefined ? injectionCodex(data) : codexOverride;
-  if (!codex) return '（重要物品表正在安全重建；当前没有可确认的回退快照）';
-  if (!codex.itemIndex) return '（暂无需要持续带入的重要道具、梗或核心细节）';
+  if (!codex?.itemIndex) return '';
   const query = recentNarrativeQuery(chat, 6);
-  const matched = selectMentionedTableRows(codex.itemIndex, query, ['物品/细节/内部梗', '物品', '细节'], 12);
-  // The item ledger already contains only plot-relevant items. Prefer current matches, but retain a
-  // bounded ledger fallback so an unmentioned but continuously carried key item is not forgotten.
-  const content = matched || tableWithLimitedRows(codex.itemIndex, 10) || '（暂无）';
-  const timeline = itemEventTimelineInjectionBlock(data, chat);
-  return `${codexSafeSnapshotPrefix(data, '重要物品表', !!codex)}${content}${timeline ? `
+  const matched = selectMentionedTableRows(codex.itemIndex, query, ['物品/细节/内部梗', '物品', '细节'], 6);
+  return parseMarkdownTable(matched || '').map(row => {
+    const name = row['物品/细节/内部梗'] || row['物品'] || row['细节'];
+    if (!isConcreteRecallName(name)) return '';
+    const fact = conciseMemory(row['核心象征意义与影响'] || row['当前状态'] || '', 300);
+    return fact ? `${name}：${fact}` : '';
+  }).filter(Boolean).join('\n');
+}
 
-${timeline}` : ''}`;
+function compactPeopleMemory(data, chat, codex) {
+  if (!codex) return '';
+  const names = new Set(normalizeRelationshipTable(data.relationshipTable).rows.map(row => row.name));
+  const parts = [];
+  for (const row of parseMarkdownTable(sanitizeCharacterMemoSection(data, codex.characterMemo))) {
+    const name = row['角色名'];
+    // The same protagonist's current development is already in the relationship block.
+    if (!name) continue;
+    const fact = conciseMemory(row['心态转变'] || (!names.has(name) ? row['当前变化'] : '') || '', 240);
+    if (fact) parts.push(`${name}：${fact}`);
+  }
+  if (settings().recallMentionedPeople) {
+    const matched = selectMentionedTableRows(codex.peopleIndex, recentNarrativeQuery(chat, 6), ['角色名', '人物'], 8);
+    for (const row of parseMarkdownTable(matched || '')) {
+      const name = row['角色名'] || row['人物'];
+      if (!name || names.has(name)) continue;
+      const identity = row['身份/标签'] || '';
+      const fact = conciseMemory(row['当前状态与核心作用'] || '', 240);
+      const relationships = Object.entries(row).filter(([key, value]) => /^与.+关系/.test(key) && value && value !== '未明').map(([key, value]) => `${key}：${conciseMemory(value, 160)}`).join('；');
+      if (fact || identity || relationships) parts.push(`${name}（${identity}）：${fact}${relationships ? '；' + relationships : ''}`);
+    }
+  }
+  return parts.join('\n');
 }
 
 function buildCoreInjection(data, chat = getContext().chat || []) {
@@ -5608,7 +5649,7 @@ function buildRecentFactsInjection(data, rows = chatRows(true), options = {}) {
     .map(row => ({ row, godlog: godlogForRow(data, row) }));
   const readyCandidates = candidates.filter(({ row, godlog }) => isGodlogReady(godlog, row));
   const missing = candidates.filter(({ row, godlog }) => !isGodlogReady(godlog, row) && rawFallbackEligible(row, assistantRows));
-  // The old 1000-char-per-Godlog rendering could exceed the section's token allocation before the
+  // The old 1000-char-per-abstract rendering could exceed the section's token allocation before the
   // first 15-turn anchor, causing fitMemorySections() to keep only the head and tail and silently
   // drop middle turns. Allocate a compact per-turn line so every unanchored ready floor remains
   // represented inside one bounded section.
@@ -5636,10 +5677,10 @@ function buildRecentFactsInjection(data, rows = chatRows(true), options = {}) {
   })));
   if (Array.isArray(options.metaTarget)) options.metaTarget.push(...recentFactsMeta);
   if (commit) state.lastRecentFactsMeta = recentFactsMeta;
-  const parts = [`### 逐楼摘要（尚未进入每 ${normalizeAnchorInterval(settings().anchorInterval)} 回合锚点）`];
+  const parts = ['### 近期事件'];
   if (fallbackEntries.length) {
-    parts.push('#### 摘要失败楼层的临时保底原文');
-    parts.push('以下只在对应逐楼摘要尚未成功、且原文已离开最近窗口时注入；禁止补写未显示的细节。');
+    parts.push('#### 原文补充');
+
     for (const { row, text } of fallbackEntries) {
       parts.push(`##### 第 ${row.assistantNumber || row.index + 1} 个AI回合（保底原文）`);
       parts.push(text);
@@ -5649,7 +5690,7 @@ function buildRecentFactsInjection(data, rows = chatRows(true), options = {}) {
     parts.push(`#### 第 ${row.assistantNumber || row.index + 1} 个AI回合`);
     parts.push(text);
   }
-  return clampTextHeadTail(parts.join('\n\n'), RECENT_FACTS_MEMORY_CHAR_BUDGET, fallbackEntries.length ? 0.58 : 0.28);
+  return parts.join('\n\n');
 }
 
 const RECALL_STOP_TERMS = new Set([
@@ -5782,7 +5823,7 @@ ${text}`);
 
 function rawRecallItem(row) {
   const rawText = isReplacementSource(row) ? '' : (row?.turnText || row?.text || '');
-  const narrative = taggedNarrativeContent(rawText) || cleanText(rawText);
+  const narrative = isReplacementSource(row) ? '' : memorySourceForRow(row);
   const body = clampTextHeadTail(narrative, 3600, 0.42);
   const sourceRevision = row?.rawHash || stableHash(rawText);
   return {
@@ -5791,6 +5832,7 @@ function rawRecallItem(row) {
     number: row?.assistantNumber || 0,
     floor: row?.index ?? null,
     kind: 'raw-recall',
+    sourceSelection: narrativeSourceSignature(),
     rawHash: row?.rawHash || '',
     body,
     title: '原楼正文保底',
@@ -5868,7 +5910,7 @@ function keywordRecall(data, query, limit = recallCandidateLimit()) {
           score += 0.55;
         }
       }
-      // A ready Godlog is the preferred memory source. Raw正文 only fills a missing-summary hole.
+      // A ready abstract is the preferred memory source. Raw正文 only fills a missing-summary hole.
       if (candidate.kind === 'godlog' && score > 0) score *= 1.06;
       const { own: _own, normalized: _normalized, ...result } = candidate;
       return { ...result, score };
@@ -5923,6 +5965,8 @@ function embeddingSignature() {
   const body = embeddingRequestBody(['signature']);
   return stableHash(JSON.stringify({
     url: baseApiUrl(s.embeddingUrl || s.secondaryUrl),
+    narrativeSchema: 2,
+    narrativeTags: narrativeSourceSignature(),
     model: body.model || '',
     dimensions: body.dimensions || '',
     mode: s.embeddingDimensionsMode || 'auto',
@@ -6605,13 +6649,14 @@ async function ensureMemoryItemEmbedded(data, id, text) {
 }
 
 function rawDetailChunksForRow(row) {
-  return chunkNarrativeText(String(row?.turnText || row?.text || ''), {
+  return chunkNarrativeText(memorySourceForRow(row, true), {
     targetTokens: RAW_DETAIL_CHUNK_TARGET_TOKENS,
     maxTokens: RAW_DETAIL_CHUNK_MAX_TOKENS,
     overlapTokens: RAW_DETAIL_CHUNK_OVERLAP_TOKENS,
     minTokens: 140,
   }).map(chunk => ({
     ...chunk,
+    text: narrativeText(chunk.text),
     id: rawChunkId(row, chunk),
     messageKey: row?.key || '',
     floor: Number(row?.index ?? -1),
@@ -6826,7 +6871,7 @@ function fuseHybridRecall(vectorHits = [], keywordHits = [], limit = recallCandi
         : 0;
       // A source that is absent from one channel must not have an artificial score ceiling.
       // Single-channel hits stay on a full 0..1 scale; dual-channel agreement can still earn
-      // a small bonus. This is especially important for raw-recall fallbacks after Godlog failure.
+      // a small bonus. This is especially important for raw-recall fallbacks after abstract failure.
       const fused = hasSemantic && hasKeyword
         ? 0.64 * hit.semanticNorm + 0.36 * hit.keywordNorm + bothBonus
         : Math.max(hit.semanticNorm, hit.keywordNorm);
@@ -6844,7 +6889,7 @@ function fuseHybridRecall(vectorHits = [], keywordHits = [], limit = recallCandi
 
 function rawChunkHitFromRecord(record, row, score = 0, method = 'embedding') {
   if (!record || !row || isReplacementSource(row) || record.rawHash !== row.rawHash) return null;
-  const source = String(row.turnText || row.text || '');
+  const source = memorySourceForRow(row, true);
   const start = Math.max(0, Number(record.start) || 0);
   const end = Math.min(source.length, Math.max(start + 1, Number(record.end) || source.length));
   const body = source.slice(start, end).trim();
@@ -6860,6 +6905,7 @@ function rawChunkHitFromRecord(record, row, score = 0, method = 'embedding') {
       chunkIndex: Number(record.chunkIndex || 0),
       start,
       end,
+      sourceSelection: narrativeSourceSignature(),
       rawHash: row.rawHash,
       body,
       title: `原文细节 ${Number(record.chunkIndex || 0) + 1}`,
@@ -7007,7 +7053,7 @@ function rawFloorLiteralCandidateKeys(query, rows = chatRows(true), limit = RAW_
   const hits = [];
   for (const row of assistantRows) {
     if (!row?.key || recentKeys.has(row.key)) continue;
-    const source = String(row.turnText || row.text || '').toLocaleLowerCase();
+    const source = memorySourceForRow(row).toLocaleLowerCase();
     if (!source) continue;
     let score = 0;
     let matches = 0;
@@ -7059,7 +7105,7 @@ async function hybridRecall(data, recallQuery, limit = recallCandidateLimit()) {
     : keywordHits;
 
   // Candidate floors come from three independent navigation signals:
-  // 1) Godlog/keyword coarse hits, 2) one centroid vector per raw floor, 3) explicit item event chains.
+  // 1) abstract/keyword coarse hits, 2) one centroid vector per raw floor, 3) explicit item event chains.
   // Only these floors (plus immediate neighbours for continuity) are opened for detailed raw chunks.
   const candidateKeys = [];
   for (const hit of coarse.slice(0, RAW_DETAIL_CANDIDATE_FLOORS)) if (hit.item?.key) candidateKeys.push(hit.item.key);
@@ -7109,15 +7155,13 @@ function taggedNarrativeContent(text) {
 function stripRecallMetaBlocks(text) {
   return String(text || '')
     .replace(/<(think|analysis|reasoning|reflection)\b[^>]*>[\s\S]*?<\/\1>/gi, ' ')
-    .replace(/<Godlog\b[^>]*>[\s\S]*?<\/Godlog>/gi, ' ')
+    .replace(/<abstract\b[^>]*>[\s\S]*?<\/abstract>/gi, ' ')
     .replace(/<!--[\s\S]*?-->/g, ' ');
 }
 
 function recallQueryMessageText(message) {
   const raw = message?.mes ?? message?.content ?? '';
-  const tagged = taggedNarrativeContent(raw);
-  if (tagged) return tagged;
-  return cleanText(stripRecallMetaBlocks(raw));
+  return narrativeText(message?.is_user || message?.role === 'user' ? raw : extractNarrativeSource(raw, selectedNarrativeTags()));
 }
 
 function buildRecallQuery(chat = getContext().chat || []) {
@@ -7160,7 +7204,7 @@ function buildRecallQuery(chat = getContext().chat || []) {
 }
 
 function recallQueryCacheKey(recallQuery) {
-  return stableHash(`${embeddingConfigured() ? `hybrid:${embeddingSignature()}` : 'keyword'}\n${recallQuery?.query || ''}`);
+  return stableHash(`${embeddingConfigured() ? `hybrid:${embeddingSignature()}` : 'keyword'}:${narrativeSourceSignature()}\n${recallQuery?.query || ''}`);
 }
 
 function clearRecallPrefetch() {
@@ -7458,7 +7502,7 @@ function dynamicRecall(data, chat, rows = chatRows(true), options = {}) {
   }
   if (!recalled.length) return '';
 
-  const parts = ['### 动态召回（与当前输入相关的旧楼细节）'];
+  const parts = ['### 相关往事'];
   const renderBudget = Math.min(recallTokenBudget(), DYNAMIC_RECALL_DETAIL_TOKEN_BUDGET);
   let renderedTokens = estimateTokens(parts[0]);
   for (const hit of recalled) {
@@ -7473,7 +7517,7 @@ function dynamicRecall(data, chat, rows = chatRows(true), options = {}) {
     if (renderedTokens + blockTokens > renderBudget) {
       const remaining = renderBudget - renderedTokens;
       if (remaining >= 180) {
-        const clipped = clampTextByTokens(block, remaining, 0.72, '…（本条原文细节因本次召回预算截短）…');
+        const clipped = fitMemoryText(block, remaining);
         if (clipped) parts.push(clipped);
       }
       break;
@@ -7605,50 +7649,30 @@ async function buildPromptReadyInjection(chat = getContext().chat || [], options
       state.lastRecallQuery = null;
     }
   }
-  const detailParts = [recentFacts, recall].filter(part => String(part || '').trim());
-  const recallEnabled = !!settings().useDynamicRecall;
-  const sectionSix = [
-    recallEnabled ? '【六. 未锚定逐楼摘要与可选动态召回】' : '【六. 未锚定逐楼摘要】',
-    detailParts.length
-      ? detailParts.join('\n\n')
-      : (recallEnabled
-        ? '（当前没有需要补充的未锚定逐楼摘要或相关旧楼召回）'
-        : '（当前没有需要补充的未锚定逐楼摘要；动态召回处于关闭状态）'),
-  ].join('\n\n');
-
-  const timeline = refreshTimelineFromGodlogs(data);
-  const timeCue = `当前剧情定位：时间 ${codex?.currentTime || '未明'}；地点 ${codex?.currentPlace || '未明'}。${timeline.warnings?.length ? ` 时间连续性存在 ${timeline.warnings.length} 条待核对提示，最近正文优先。` : ''}`;
+  const time = usefulCodexValue(codex?.currentTime) ? codex.currentTime : '';
+  const place = usefulCodexValue(codex?.currentPlace) ? codex.currentPlace : '';
+  const position = [time, place].filter(Boolean).join(' · ');
+  const relations = normalizeRelationshipTable(data.relationshipTable).rows.map(row => {
+    const past = conciseMemory(row.past, 180);
+    const current = conciseMemory(row.current, 260);
+    return past || current ? `${row.name}：${[past, current].filter(Boolean).join('；')}` : '';
+  }).filter(Boolean).join('\n');
   const budget = currentMemoryTokenBudget(chat);
-  // The previous fixed per-section maxima summed to 11,600 tokens, so raising the user-visible
-  // memory limit above that value had no effect. Scale both section caps and source text ceilings
-  // when a larger budget is genuinely available.
-  const sectionScale = Math.max(1, Math.min(3, budget / BASE_SECTION_MAX_TOKENS));
-  const sectionMax = value => Math.max(value, Math.round(value * sectionScale));
-  const charScale = Math.max(1, Math.min(3, sectionScale));
+  const scale = Math.max(1, Math.min(3, budget / BASE_SECTION_MAX_TOKENS));
   const sections = [
-    {
-      id: 'relationship', minTokens: 320, maxTokens: sectionMax(1500), weight: 1.2, headRatio: 0.45,
-      text: [
-        '锚点记录',
-        '使用边界：以下均为已经发生的剧情记忆。直接延续当前正文，不复述资料标题，不写整理说明；若与最近正文冲突，以最近正文为准。',
-        timeCue,
-        '【一. 人物关系】',
-        relationshipInjectionBlock(data, Math.round(RELATIONSHIP_MEMORY_CHAR_BUDGET * charScale)),
-      ].join('\n\n'),
-    },
-    {
-      id: 'anchors', minTokens: 1100, maxTokens: sectionMax(4300), weight: 3.8, headRatio: 0.28,
-      truncationMarker: '…（锚点事件中段因本次预算省略；这不是完整列表，必要时可由旧楼动态召回补回相关细节）…',
-      text: `【二. 锚点事件】\n\n${anchorEventInjectionBlock(data, charScale)}`,
-    },
-    { id: 'character', minTokens: 260, maxTokens: sectionMax(1050), weight: 1.1, headRatio: 0.38, text: `【三. ${trackedLabel} 动态演变（核心转变）】\n\n${safeCodexText(characterMemo, Math.round(3200 * charScale))}` },
-    { id: 'people', minTokens: 180, maxTokens: sectionMax(850), weight: 0.8, headRatio: 0.45, text: `【四. 匹配到的出场人物库】\n\n${safeCodexText(matchedPeopleInjectionBlock(data, chat, codex), Math.round(2200 * charScale))}` },
-    { id: 'items', minTokens: 180, maxTokens: sectionMax(900), weight: 0.9, headRatio: 0.45, text: `【五. 重要道具、梗与核心细节】\n\n${safeCodexText(importantItemsInjectionBlock(data, chat, codex), Math.round(2400 * charScale))}` },
-    { id: 'recent', minTokens: 1400, maxTokens: sectionMax(3000), weight: 3.6, headRatio: 0.48, text: sectionSix },
-  ];
-
-  const fitted = fitMemorySections(sections, budget);
-  const bounded = sanitizeMainPromptMemoryText(fitted.text);
+    { id: 'context', title: '当前状态', text: [position, relations].filter(Boolean).join('\n'), minTokens: 260, maxTokens: 1100 * scale, weight: 1.5 },
+    { id: 'anchors', title: '剧情主线', text: anchorEventInjectionBlock(data, scale), minTokens: 1000, maxTokens: 4300 * scale, weight: 4 },
+    { id: 'recent', title: '近期事件', text: recentFacts, minTokens: 1000, maxTokens: 3000 * scale, weight: 4 },
+    { id: 'people', title: '相关人物', text: compactPeopleMemory(data, chat, codex), minTokens: 120, maxTokens: 700 * scale, weight: 0.8 },
+    { id: 'items', title: '相关物品', text: importantItemsInjectionBlock(data, chat, codex), minTokens: 120, maxTokens: 650 * scale, weight: 0.8 },
+    { id: 'recall', title: '相关往事', text: recall, minTokens: 160, maxTokens: 1400 * scale, weight: 1 },
+  ].filter(section => section.text.trim()).map(section => ({ ...section,
+    text: `【${section.title}】\n${section.text}`, fitText: fitMemoryText,
+  }));
+  const prefix = '锚点记录\n以下为剧情资料；与当前正文冲突时，以当前正文为准。\n';
+  const fitted = fitMemorySections(dedupeMemorySections(sections), Math.max(0, budget - estimateTokens(prefix)));
+  const body = sanitizeMainPromptMemoryText(fitted.text);
+  const bounded = body ? `${prefix}${body}` : '';
   const memoryBudget = {
     budgetTokens: budget,
     usedTokens: estimateTokens(bounded),
@@ -7660,6 +7684,8 @@ async function buildPromptReadyInjection(chat = getContext().chat || [], options
   if (commit) {
     state.lastMemoryBudget = memoryBudget;
     state.lastPromptInjection = bounded;
+  } else {
+    state.previewMemoryBudget = memoryBudget;
   }
   return bounded;
 }
@@ -7700,8 +7726,8 @@ function refreshCommittedRecallUi() {
     if (!$ || !$('#anchor_memory_workbench').length || !$('#anchor_memory_workbench').hasClass('open')) return;
     if (!state.selectedRecallMessageKey) {
       $('#am_recall_preview_title').text(settings().useDynamicRecall
-        ? '第六段：未锚定摘要 + 可选旧楼召回（本轮实际注入）'
-        : '第六段：未锚定摘要（动态召回已关闭）');
+        ? '最近一次生成的候选补充（最终内容以上方完整文本为准）'
+        : '近期事件（旧楼检索已关闭）');
       $('#am_recall_preview_note').hide();
       $('#am_clear_recall_selection').hide();
       const lifecycle = state.lastRecallQuery ? `【召回状态】${recallStageText(state.lastRecallQuery)}\n\n` : '';
@@ -7836,9 +7862,10 @@ function isAnchorMemoryPromptMessage(message) {
   const content = typeof message?.content === 'string' ? message.content : '';
   return message?.role === 'system'
     && /^锚点记录(?:\r?\n|$)/.test(content)
-    && content.includes('【一. 人物关系】')
+    && (content.includes('以下为剧情资料；与当前正文冲突时，以当前正文为准。')
+      || (content.includes('【一. 人物关系】')
     && content.includes('【二. 锚点事件】')
-    && content.includes('【六.');
+    && content.includes('【六.')));
 }
 
 function removeExistingAnchorMemoryPrompt(promptChat) {
@@ -8277,7 +8304,7 @@ function syncGodlogsWithChat(reason = '聊天变动') {
     }
   }
 
-  // Raw-fallback anchors also need invalidation when there was no completed Godlog to revoke.
+  // Raw-fallback anchors also need invalidation when there was no completed abstract to revoke.
   for (const derived of [...(data.anchors || []), ...(data.merges || [])]) {
     for (const [key, hash] of Object.entries(derived.sourceRevisions || {})) {
       const row = byKey.get(key);
@@ -8686,7 +8713,8 @@ function recallHitIsCurrent(data, hit) {
     return isGodlogReady(current, row) && current.id === hit.item.id
       && current.body === hit.item.body && hit.item.rawHash === row.rawHash;
   }
-  return !!hit.item.rawHash && hit.item.rawHash === row.rawHash;
+  return !!hit.item.rawHash && hit.item.rawHash === row.rawHash
+    && (!hit.item.sourceSelection || hit.item.sourceSelection === narrativeSourceSignature());
 }
 
 function captureSourceRevision(data, keys = null) {
@@ -8867,8 +8895,8 @@ async function runGodlogPostCommitTasks(data, row, item, contextToken) {
   await runStep('人物/Codex后处理', () => updateCodexFromGodlog(data, row, item));
   await runStep('实体事件链更新', async () => { refreshItemEventTimeline(data, { row }); });
   await runStep('原文细节向量索引', async () => {
-    // The canonical Godlog is already durable. Vector indexing is a rebuildable cache only.
-    // Any embedding/IndexedDB failure must stay in the vector subsystem and never demote Godlog.
+    // The canonical abstract is already durable. Vector indexing is a rebuildable cache only.
+    // Any embedding/IndexedDB failure must stay in the vector subsystem and never demote abstract.
     removeStoredVector(data, rawRecallItem(row).id);
     await ensureRecallVectorsForRow(data, row, item, null);
   });
@@ -8951,6 +8979,7 @@ async function generateGodlogForRowUnlocked(row, force = false) {
 
   state.forcedSummaryReruns.delete(row.key);
   const sourceHash = row.rawHash;
+  const selectionSignature = narrativeSourceSignature();
   const item = replacingCompleted
     ? existing
     : upsertGodlog(data, row, force
@@ -8974,9 +9003,11 @@ async function generateGodlogForRowUnlocked(row, force = false) {
 
   let summaryCommitted = false;
   try {
+    const aiSource = narrativeText(extractNarrativeSource(row.text || '', selectedNarrativeTags()));
+    if (!aiSource) throw new Error('未找到所选 XML 正文；请在设置中检查正文标签。');
     const basePrompt = buildGodlogPrompt(data, row, item);
     let body = '';
-    if (item.pendingGeneratedBody && item.pendingGeneratedRawHash === sourceHash) {
+    if (item.pendingGeneratedBody && item.pendingGeneratedRawHash === sourceHash && item.pendingSourceSelection === selectionSignature) {
       body = normalizeGodlogBlock(item.pendingGeneratedBody);
     } else {
       body = normalizeGodlogBlock(await callSummaryWriter(basePrompt, 1200, {
@@ -9014,7 +9045,7 @@ async function generateGodlogForRowUnlocked(row, force = false) {
       invalidateRuntimeCaches('summary source re-resolve');
       latestRow = currentRowForGodlog(item);
     }
-    if (!latestRow || latestRow.rawHash !== sourceHash) {
+    if (!latestRow || latestRow.rawHash !== sourceHash || selectionSignature !== narrativeSourceSignature()) {
       if (replacingCompleted) {
         item.rerunPending = false;
         item.rerunError = latestRow
@@ -9043,6 +9074,7 @@ async function generateGodlogForRowUnlocked(row, force = false) {
         // the already-generated candidate so the next stable pass can commit it without another API call.
         item.pendingGeneratedBody = body;
         item.pendingGeneratedRawHash = sourceHash;
+        item.pendingSourceSelection = selectionSignature;
         item.sourceLookupDeferredAt = Date.now();
         item.status = 'pending';
         item.error = '摘要已生成，正在等待酒馆确认源楼；未确认的内容不参与当前记忆。';
@@ -9074,6 +9106,7 @@ async function generateGodlogForRowUnlocked(row, force = false) {
       assistantNumber: latestRow.assistantNumber || item.assistantNumber || 0,
       body,
       rawHash: sourceHash,
+      sourceSelection: selectionSignature,
       status: 'ready',
       stale: false,
       staleSince: 0,
@@ -9100,7 +9133,7 @@ async function generateGodlogForRowUnlocked(row, force = false) {
     refreshCoverageMaps(data);
     refreshTimelineFromGodlogs(data);
     data.processing.lastError = '';
-    // COMMIT BOUNDARY: from this line onward the Godlog is a durable success. Hide/Codex/entity/
+    // COMMIT BOUNDARY: from this line onward the abstract is a durable success. Hide/Codex/entity/
     // vector work is best-effort post-processing and is forbidden from falling into the summary
     // retry catch below. This prevents the v1.1.1 loop: ready -> vector error -> pending -> rewrite.
     saveMemory(true);
@@ -9111,7 +9144,7 @@ async function generateGodlogForRowUnlocked(row, force = false) {
     return true;
   } catch (err) {
     if (!isSameChatContext(contextToken)) return false;
-    // Absolute safety net: once the validated Godlog crossed the commit boundary, no later error
+    // Absolute safety net: once the validated abstract crossed the commit boundary, no later error
     // may demote it or schedule another summary API request. runGodlogPostCommitTasks already
     // isolates known post-processors; this guard also covers unexpected future post-commit code.
     invalidateRuntimeCaches();
@@ -10376,7 +10409,7 @@ function updatePreview() {
     try {
       maybeWarnMissingGodlogs(data);
     } catch (err) {
-      console.warn('[AnchorMemory] missing Godlog warning failed', err);
+      console.warn('[AnchorMemory] missing abstract warning failed', err);
     }
     return;
   }
@@ -10429,13 +10462,17 @@ function updatePreview() {
     || (!codexHasContent(data.codexBackup.codex) && !relationshipHasContent(data.codexBackup.relationshipTable)));
   $('#am_current_time_edit').val(data.codex.currentTime || '');
   $('#am_current_place_edit').val(data.codex.currentPlace || '');
-  $('#am_core_preview').val('正在生成六段记忆拼接预览……');
+  $('#am_core_preview').val('正在预览……');
   const previewContextToken = captureChatContextToken(data);
   // Workbench preview must be side-effect free. It may run while the main model is already
   // generating, so it must never overwrite the recall record that was actually injected.
   buildPromptReadyInjection(getContext().chat || [], { commit: false }).then(content => {
     if (isSameChatContext(previewContextToken) && $('#anchor_memory_workbench').hasClass('open')) {
       $('#am_core_preview').val(content || '暂无可注入记忆。');
+      $('#am_injection_size').text(`${estimateTokens(content)} Token · ${content.length} 字符`);
+      const labels = { context: '当前状态', anchors: '剧情主线', recent: '近期事件', people: '相关人物', items: '相关物品', recall: '相关往事' };
+      $('#am_injection_sections').html((state.previewMemoryBudget?.allocations || []).map(part =>
+        `<span>${labels[part.id] || escapeHtml(part.id)} ${part.renderedTokens} Token${part.truncated ? ' · 部分选取' : ''}</span>`).join(''));
       $('#am_stat_tokens').text(estimateMemoryTokens(data));
     }
   }).catch(err => {
@@ -10449,8 +10486,8 @@ function updatePreview() {
     $('#am_recall_preview').val(formatMessageRecallDetail(selectedRecall, data));
   } else {
     $('#am_recall_preview_title').text(settings().useDynamicRecall
-      ? '第六段：未锚定摘要 + 可选旧楼召回（本轮实际注入）'
-      : '第六段：未锚定摘要（动态召回已关闭）');
+      ? '最近一次生成的候选补充（最终内容以上方完整文本为准）'
+      : '近期事件（旧楼检索已关闭）');
     $('#am_recall_preview_note').hide();
     $('#am_clear_recall_selection').hide();
     const lifecycle = state.lastRecallQuery ? `【召回状态】${recallStageText(state.lastRecallQuery)}\n\n` : '';
@@ -10480,7 +10517,7 @@ function updatePreview() {
   try {
     maybeWarnMissingGodlogs(data);
   } catch (err) {
-    console.warn('[AnchorMemory] missing Godlog warning failed', err);
+    console.warn('[AnchorMemory] missing abstract warning failed', err);
   }
 }
 
@@ -10534,7 +10571,7 @@ function renderTableCards(containerSelector, markdown, emptyText, titleKeys = []
     const title = renderMacros(titleEntry?.[1] || titleEntry?.[0] || '未命名');
     const body = entries
       .filter(([key]) => key !== titleEntry?.[0])
-      .map(([key, value]) => `<div><span class="am-pill">${escapeHtml(renderMacros(key))}</span> ${escapeHtml(renderMacros(value || '未记录'))}</div>`)
+      .map(([key, value]) => `<div class="am-reading-field"><span>${escapeHtml(renderMacros(key))}</span><div>${escapeHtml(renderMacros(value || '未记录'))}</div></div>`)
       .join('');
     container.append(`
       <div class="am-card">
@@ -10584,7 +10621,7 @@ function renderGodlogList() {
     return;
   }
 
-  const pageSize = Math.max(20, Number(state.godlogPageSize) || 80);
+  const pageSize = 20;
   const pageCount = Math.max(1, Math.ceil(entries.length / pageSize));
   state.godlogPage = Math.min(Math.max(0, Number(state.godlogPage) || 0), pageCount - 1);
   const pageEntries = entries.slice(state.godlogPage * pageSize, (state.godlogPage + 1) * pageSize);
@@ -10600,7 +10637,8 @@ function renderGodlogList() {
 
   for (const { item, synthetic } of pageEntries) {
     const displayText = item.body ? plainGodlogText(item.body) : (item.error || '等待生成。');
-    const excerpt = displayText.slice(0, 260);
+    const excerpt = displayText;
+    const readable = item.body ? [['Title', '事件'], ['Time', '时间'], ['Pln', '地点'], ['Per', '人物'], ['Cond', '经过与结果']].map(([tag, label]) => { const value = godlogFieldValue(item.body, tag); return value ? `<div class="am-reading-field"><span>${label}</span><div>${escapeHtml(value)}</div></div>` : ''; }).join('') : escapeHtml(displayText);
     const status = item.archived ? 'archived' : (item.status === 'failed' ? 'failed' : (item.stale ? 'stale' : (item.status || 'pending')));
     const actions = item.archived
       ? ''
@@ -10611,8 +10649,8 @@ function renderGodlogList() {
           <span>第 ${escapeHtml(item.floor ?? 0)} 楼 · ${escapeHtml(item.name || '未知')}</span>
           <span class="am-pill">${escapeHtml(godlogStatusLabel(status, item))}</span>
         </div>
-        <div class="am-card-meta">Nub ${escapeHtml(item.number || '')} · ${item.updatedAt ? new Date(item.updatedAt).toLocaleString() : '未生成'}</div>
-        <div class="am-card-body">${escapeHtml(excerpt)}${displayText.length > excerpt.length ? '...' : ''}</div>
+        <div class="am-card-meta">轮次 ${escapeHtml(item.number || '')} · ${item.updatedAt ? new Date(item.updatedAt).toLocaleString() : '未生成'}</div>
+        <div class="am-card-body">${readable}</div>
         ${actions}
       </div>
     `);
@@ -10908,7 +10946,7 @@ function renderGodlogPanelForIndex(messageIndex, prepared = null) {
   const message = chat[index];
   if (!message || message.is_user || message.is_system) return false;
   if (stripGodlogFromMessageRecord(message)) {
-    invalidateRuntimeCaches('removed leaked Godlog block');
+    invalidateRuntimeCaches('removed leaked abstract block');
     refreshMessageBlock(index);
     saveChatNow();
     scheduleGodlogPanelRender(index, 1);
@@ -11118,7 +11156,7 @@ function showGodlogInWorkbench(id) {
   openWorkbench();
   activateTab('summaries');
   renderGodlogList();
-  $('#am_godlog_detail').val(item?.body || item?.error || (syntheticRow ? messageGodlogBody(null, syntheticRow) : ''));
+  $('#am_godlog_detail').val(normalizeGodlogBlock(item?.body) || item?.error || (syntheticRow ? messageGodlogBody(null, syntheticRow) : ''));
 }
 
 function showRecallRecordInWorkbench(messageKey) {
@@ -11537,7 +11575,7 @@ async function rerunSelectedGodlog() {
     }
     const ok = await generateGodlogForRow(syntheticRow, true);
     const current = godlogForRow(memoryData(), syntheticRow);
-    $('#am_godlog_detail').val(current?.body || current?.error || '');
+    $('#am_godlog_detail').val(normalizeGodlogBlock(current?.body) || current?.error || '');
     updatePreview();
     if (ok) toastr?.success?.(`第 ${syntheticRow.index} 楼摘要已生成`, 'Anchor Memory');
     else if (current?.rerunQueued || state.forcedSummaryReruns.has(syntheticRow.key)) toastr?.info?.('当前楼正文仍在生成或等待稳定；手动重跑已排队，稳定后会自动执行。', 'Anchor Memory');
@@ -11568,7 +11606,7 @@ async function rerunSelectedGodlog() {
   }
   const ok = await generateGodlogForRow(row, true);
   const current = godlogForRow(memoryData(), row);
-  $('#am_godlog_detail').val(current?.body || current?.error || '');
+  $('#am_godlog_detail').val(normalizeGodlogBlock(current?.body) || current?.error || '');
   updatePreview();
   if (ok) toastr?.success?.(`第 ${row.index} 楼摘要已重新生成`, 'Anchor Memory');
   else if (current?.rerunQueued || state.forcedSummaryReruns.has(row.key)) toastr?.info?.('当前楼正文仍在生成或等待稳定；手动重跑已排队，稳定后会自动执行。', 'Anchor Memory');
@@ -12465,6 +12503,7 @@ function renderRelationshipEditor(data = memoryData()) {
   const container = $('#am_relationship_rows');
   if (!container.length) return;
   const table = normalizeRelationshipTable(data.relationshipTable, data.codex?.relationship || '');
+  $('#am_relationship_cards').html(table.rows.map(row => `<article class="am-card"><div class="am-card-title">${escapeHtml(renderMacros(row.name))}</div>${[['当前关系', row.current], ['关系变化', row.development], ['过去关系', row.past]].map(([label, value]) => `<div class="am-reading-field"><span>${label}</span><div>${escapeHtml(renderMacros(value || '未记录'))}</div></div>`).join('')}</article>`).join(''));
   container.empty();
   for (const row of table.rows) {
     const displayName = renderMacros(row.name);
@@ -13125,6 +13164,9 @@ function installNavbarEntry(attempt = 0) {
 
 function loadUi() {
   const s = settings();
+  $('#am_source_tags').val(s.narrativeTags);
+  $('#am_source_custom').val(s.narrativeCustomTags);
+  refreshSourcePreview();
   $('#am_enabled').prop('checked', !!s.enabled);
   $('#am_anchor_interval').val(s.anchorInterval);
   $('#am_merge_anchor_interval').val(s.mergeAnchorInterval);
@@ -13172,19 +13214,27 @@ function setAdvancedTabsExpanded(expanded) {
   $('.anchor-memory-settings .am-tabs').toggleClass('am-show-advanced', show);
   $('#am_toggle_advanced_tabs')
     .attr('aria-expanded', show ? 'true' : 'false')
-    .text(show ? '收起高级' : '更多功能');
+    .text(show ? '收起' : '更多');
 }
 
 function activateTab(tab) {
-  const target = $(`.anchor-memory-settings .am-tab[data-tab="${tab}"]`);
+  const stateTabs = ['relationships', 'characters', 'items', 'scenes'];
+  const sub = stateTabs.includes(tab) ? tab : (tab === 'state' ? 'relationships' : '');
+  const main = sub ? 'state' : tab;
+  const target = $(`.anchor-memory-settings .am-tabs .am-tab[data-tab="${main}"]`);
   if (target.hasClass('am-advanced-tab')) setAdvancedTabsExpanded(true);
-  $('.anchor-memory-settings .am-tab').removeClass('active');
+  $('.anchor-memory-settings .am-tabs .am-tab').removeClass('active');
   target.addClass('active');
   $('.anchor-memory-settings .am-tab-panel').removeClass('active');
-  $(`.anchor-memory-settings .am-tab-panel[data-panel="${tab}"]`).addClass('active');
+  $(`.anchor-memory-settings .am-tab-panel[data-panel="${main}"]`).addClass('active');
+  if (sub) {
+    $('.anchor-memory-settings .am-state-panel, .anchor-memory-settings .am-state-tab').removeClass('active');
+    $(`.anchor-memory-settings .am-state-panel[data-panel="${sub}"], .anchor-memory-settings .am-state-tab[data-tab="${sub}"]`).addClass('active');
+  }
 }
 
 function bindUi() {
+  $('[data-am-nav]').on('click', function () { activateTab($(this).data('am-nav')); });
   $('.anchor-memory-settings .am-tab[data-tab]').on('click', function () {
     activateTab($(this).data('tab'));
   });
@@ -13203,6 +13253,15 @@ function bindUi() {
   });
   $('#am_anchor_interval').on('change', function () { applyIntervalSettingChange('anchorInterval', this.value, this); });
   $('#am_merge_anchor_interval').on('change', function () { applyIntervalSettingChange('mergeAnchorInterval', this.value, this); });
+  $('#am_source_tags, #am_source_custom').on('change', function () {
+    saveSetting('narrativeTags', $('#am_source_tags').val());
+    saveSetting('narrativeCustomTags', $('#am_source_custom').val());
+    clearRecallPrefetch();
+    invalidateRuntimeCaches();
+    state.lastRecall = '';
+    refreshSourcePreview();
+  });
+  $('#am_refresh_source').on('click', refreshSourcePreview);
   $('#am_keep_recent').on('change', function () {
     saveSetting('keepRecent', Math.max(1, Number(this.value) || 3));
     reconcileStrictRecentWindow('保留轮数设置已变化').catch(console.warn);
@@ -13315,7 +13374,7 @@ function bindUi() {
     state.selectedGodlogId = id;
     const item = (memoryData().godlogs || []).find(entry => entry.id === id);
     const syntheticRow = rowFromSyntheticGodlogId(id);
-    $('#am_godlog_detail').val(item?.body || item?.error || (syntheticRow ? `第 ${syntheticRow.index} 楼尚未生成逐楼摘要。请点“重跑本楼摘要”或“自动补写缺失摘要”，插件会调用模型自动补写。` : ''));
+    $('#am_godlog_detail').val(normalizeGodlogBlock(item?.body) || item?.error || (syntheticRow ? `第 ${syntheticRow.index} 楼尚未生成逐楼摘要。请点“重跑本楼摘要”或“自动补写缺失摘要”，插件会调用模型自动补写。` : ''));
   });
   $('#am_godlog_list').on('click', '.am-rerun-godlog', async function (event) {
     event.stopPropagation();

@@ -123,6 +123,7 @@ const COMMON_ITEM_SUFFIXES = [
 
 export function itemAliasTokens(name) {
   const raw = String(name || '').trim();
+  if (raw.length > 48 || /[“”「」『』"\n!?！？。]/.test(raw)) return [];
   const full = normalizedText(raw);
   const aliases = new Set(full ? [full] : []);
   for (const part of raw.split(/[／/、,，;；|()（）【】\[\]：:·•]+/)) {

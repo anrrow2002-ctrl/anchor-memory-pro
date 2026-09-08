@@ -1030,3 +1030,31 @@ body.am-workbench-open {
   font-size: 13px;
   padding: 10px 12px;
 }
+
+/* Reading order: source summaries -> timeline -> state -> outgoing memory. */
+.anchor-memory-settings .am-memory-flow { display:flex; gap:12px; align-items:center; margin:8px 0 20px; }
+.anchor-memory-settings .am-memory-flow button { flex:1; display:grid; gap:6px; padding:16px 10px; text-align:left; }
+.anchor-memory-settings .am-memory-flow small { opacity:.7; font-size:12px; }
+.anchor-memory-settings .am-state-nav { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:18px; }
+.anchor-memory-settings .am-state-panel { display:none; }
+.anchor-memory-settings .am-state-panel.active { display:block; }
+.anchor-memory-settings #am_core_preview { min-height:420px; line-height:1.7; }
+.anchor-memory-settings .am-editor { margin:16px 0; }
+.anchor-memory-settings .am-editor > summary { cursor:pointer; padding:10px 0; }
+@media(max-width:600px) { .anchor-memory-settings .am-memory-flow {gap:6px;} .anchor-memory-settings .am-memory-flow button {padding:12px 6px;} }
+
+.anchor-memory-settings .am-injection-sections { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:16px; }
+.anchor-memory-settings .am-injection-sections span { font-size:12px; padding:6px 10px; border:1px solid var(--SmartThemeBorderColor,#555); border-radius:6px; }
+
+/* Reading comes before editing. */
+.am-reading-field { display:grid; grid-template-columns:6em minmax(0,1fr); gap:12px; padding:9px 0; border-bottom:1px solid #ffffff12; line-height:1.65; }
+.am-reading-field > span { opacity:.65; font-size:.9em; }
+.am-reading-field > div { white-space:pre-wrap; overflow-wrap:anywhere; }
+.am-card-list { min-width:0; }
+@media(max-width:600px) { .am-reading-field {grid-template-columns:1fr;gap:2px;} }
+
+@media (max-width:600px) {
+  .anchor-memory-settings .am-tabs { flex-wrap:wrap; overflow:visible; position:static; }
+  .anchor-memory-settings .am-tabs .am-tab { flex:1 0 27%; min-width:0; padding:8px 4px; }
+  .anchor-memory-settings .am-tabs .am-more-tab { flex:0 0 100%; min-height:30px; padding:3px; }
+}
