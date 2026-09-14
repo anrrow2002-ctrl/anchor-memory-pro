@@ -93,6 +93,17 @@ export function dedupeMemorySections(sections) {
   }).join('\n') }));
 }
 
+// Opening greetings may be plain text even when later replies use configured XML tags.
+// Keep offsets intact for detail chunks, and retain the normal reasoning filters.
+export function extractMessageNarrativeSource(value, tags, messageIndex) {
+  const selected = extractNarrativeSource(value, tags);
+  const body = selected.replace(/^【(?:用户输入|AI回复)｜[^\n]*\n/gm, '');
+  if (messageIndex === 0 && tags !== null && !narrativeText(body)) {
+    return maskNarrativeSource(value);
+  }
+  return selected;
+}
+
 // Select only complete configured XML bodies; mask everything else before chunking.
 export function extractNarrativeSource(value, tags = ['context', 'content']) {
   const source = String(value || '');

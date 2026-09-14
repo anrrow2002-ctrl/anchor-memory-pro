@@ -15,7 +15,7 @@ import {
   resolveAdaptiveMemoryBudget,
   fitMemorySections,
 } from './core/runtime-controls.js';
-import { extractNarrativeSource, maskNarrativeSource, narrativeText, isConcreteRecallName, fitMemoryText, conciseMemory, dedupeMemorySections } from './core/memory-presentation.js';
+import { extractNarrativeSource, extractMessageNarrativeSource, maskNarrativeSource, narrativeText, isConcreteRecallName, fitMemoryText, conciseMemory, dedupeMemorySections } from './core/memory-presentation.js';
 import { rebuildTimelineState } from './core/time-engine.js';
 import {
   entityKey,
@@ -2259,14 +2259,15 @@ function selectedNarrativeTags() {
 }
 function narrativeSourceSignature() { return JSON.stringify(selectedNarrativeTags()); }
 function memorySourceForRow(row, masked = false) {
-  if (selectedNarrativeTags() !== null && row?.text && !narrativeText(extractNarrativeSource(row.text, selectedNarrativeTags()))) return '';
-  const text = extractNarrativeSource(row?.turnText || row?.text || '', selectedNarrativeTags());
+  const tags = selectedNarrativeTags();
+  if (tags !== null && row?.text && !narrativeText(extractMessageNarrativeSource(row.text, tags, row.index))) return '';
+  const text = extractMessageNarrativeSource(row?.turnText || row?.text || '', tags, row?.index);
   return masked ? text : narrativeText(text);
 }
 function refreshSourcePreview() {
   const messages = getContext().chat || [];
   const latest = [...messages].reverse().find(m => m && !m.is_user && !m.is_system && !m.is_hidden);
-  const text = narrativeText(extractNarrativeSource(latest?.mes || '', selectedNarrativeTags()));
+  const text = narrativeText(extractMessageNarrativeSource(latest?.mes || '', selectedNarrativeTags(), messages.indexOf(latest)));
   $('#am_source_preview').val(text);
   $('#am_source_status').text(text ? `提取到 ${text.length} 字正文` : '未找到正文：请检查标签名称与回复内容。');
   $('#am_source_custom_wrap').toggle(settings().narrativeTags === 'custom');
@@ -2277,11 +2278,11 @@ function collectRecentOriginalContext(row, limit = 8) {
   const end = Number.isInteger(row?.index) ? row.index : chat.length;
   return chat
     .slice(Math.max(0, end - limit), end)
-    .filter(message => message && !message.is_system && !message.is_hidden && message.mes)
     .map((message, offset) => {
-      const floor = Math.max(0, end - limit) + offset + 1;
+      if (!message || message.is_system || message.is_hidden || !message.mes) return '';
+      const floor = Math.max(0, end - limit) + offset;
       const role = message.is_user ? '用户' : 'AI';
-      const body = narrativeText(message.is_user ? message.mes : extractNarrativeSource(message.mes, selectedNarrativeTags()));
+      const body = narrativeText(message.is_user ? message.mes : extractMessageNarrativeSource(message.mes, selectedNarrativeTags(), floor));
       return body ? `第${floor}楼 ${role} ${message.name || '未命名'}：${conciseMemory(body, 500)}` : '';
     })
     .filter(Boolean);
@@ -9003,8 +9004,8 @@ async function generateGodlogForRowUnlocked(row, force = false) {
 
   let summaryCommitted = false;
   try {
-    const aiSource = narrativeText(extractNarrativeSource(row.text || '', selectedNarrativeTags()));
-    if (!aiSource) throw new Error('未找到所选 XML 正文；请在设置中检查正文标签。');
+    const aiSource = narrativeText(extractMessageNarrativeSource(row.text || '', selectedNarrativeTags(), row.index));
+    if (!aiSource) throw new Error(row.index === 0 ? '第 0 楼未找到可提取的正文。' : '未找到所选 XML 正文；请在设置中检查正文标签。');
     const basePrompt = buildGodlogPrompt(data, row, item);
     let body = '';
     if (item.pendingGeneratedBody && item.pendingGeneratedRawHash === sourceHash && item.pendingSourceSelection === selectionSignature) {

@@ -294,7 +294,7 @@
         <div class="am-panel"><h3>正文来源</h3>
           <label>AI 回复中的正文标签<select id="am_source_tags" class="text_pole"><option value="auto">context 或 content</option><option value="context">仅 context</option><option value="content">仅 content</option><option value="custom">自定义标签</option><option value="plain">无 XML：纯正文回复</option></select></label>
           <label id="am_source_custom_wrap">标签名称（多个用逗号分隔）<input id="am_source_custom" class="text_pole" placeholder="例如 story, narrative" /></label>
-          <p class="am-note">只提取完整标签内的正文，排除思考内容。更换标签后，已有摘要保留；有误的楼层请在“逐楼摘要”重跑。</p>
+          <p class="am-note">优先提取完整标签内的正文，排除思考内容。第 0 楼开场白没有可用标签正文时，自动直接提取文本；其他楼层仍按所选标签提取。更换标签后，已有摘要保留；有误的楼层请在“逐楼摘要”重跑。</p>
           <details><summary>检查最近一条回复的正文</summary><button id="am_refresh_source" type="button">刷新检查</button><div id="am_source_status"></div><textarea id="am_source_preview" class="am-preview text_pole" readonly></textarea></details>
         </div>
         <div class="am-section-title">第一步：填写副API</div>
