@@ -56,7 +56,7 @@ test('saved depth settings, including rp.3 tail settings, migrate to depth four'
     const r = runtime();
     r.host.extensionSettings.anchor_memory = { settingsVersion: version, injectionDepth: depth };
     assert.equal(r.run('settings().injectionDepth'), 4);
-    assert.equal(r.host.extensionSettings.anchor_memory.settingsVersion, '1.1.4-rp.4');
+    assert.equal(r.host.extensionSettings.anchor_memory.settingsVersion, '1.1.4-rp.5');
   }
   assert.equal(runtime().run('settings().injectionDepth'), 4);
 });
@@ -222,4 +222,110 @@ test('Chat Completion injects once at depth four after system squashing, with no
   assert.equal(chat[3].content, '锚点记录\n以下为剧情资料；与当前正文冲突时，以当前正文为准。\nunchanged memory');
   assert.equal(chat.filter(m => m.content.startsWith('锚点记录')).length, 1);
   assert.equal(chat.at(-1).content, 'trailing rules');
+});
+
+test('a live visible stream wins over an idle host flag and an early end event', () => {
+  const r = withRow();
+  r.host.isGenerating = false;
+  r.host.streamingProcessor = { type: 'normal', isFinished: false, isStopped: false };
+  r.run(`state.generationLifecycleActive = true; syncGodlogsWithChat = () => {}; invalidateRuntimeCaches = () => {}; scheduleGodlogPanelRender = () => {};`);
+  r.run("onGenerationFinished('premature end'); onMessageReceived(1, 'normal');");
+  assert.equal(r.run('generationIsActiveForGodlog(row)'), true);
+  assert.equal(r.run('state.finalizedRowHashes.has(row.key)'), false);
+  assert.equal(r.calls.timers.size, 0);
+  r.host.streamingProcessor.isFinished = true;
+  r.run("onGenerationFinished('actual end')");
+  assert.equal(r.run('generationIsActiveForGodlog(row)'), false);
+  assert.equal(r.calls.timers.size, 1);
+});
+
+test('quiet streams do not block a completed visible message', () => {
+  const r = runtime();
+  r.host.isGenerating = false;
+  r.host.streamingProcessor = { type: 'quiet', isFinished: false, isStopped: false };
+  assert.equal(r.run('hostGenerationState()'), false);
+});
+
+test('unfinished rows never enter the running-task registry, including manual reruns', async () => {
+  for (const force of [false, true]) {
+    const r = withRow();
+    r.run(`
+      hasPersistentChatContext = () => true;
+      state.generationLifecycleActive = true;
+      globalThis.started = 0;
+      generateGodlogForRowUnlocked = async () => { started++; return false; };
+      scheduleGodlogPanelRender = () => {};
+    `);
+    r.context.force = force;
+    const task = r.run('generateGodlogForRow(row, force)');
+    assert.equal(r.run('state.summaryTasks.size'), 0);
+    assert.equal(r.run('started'), 0);
+    await task;
+    assert.equal(r.run('state.forcedSummaryReruns.has(row.key)'), force);
+    assert.equal(r.calls.timers.size, 0);
+  }
+});
+
+function panelRuntime() {
+  const r = withRow();
+  const dom = { inserted: 0, removed: 0 };
+  const panel = { dataset: {}, classList: { contains: () => false }, remove() { dom.removed++; } };
+  const text = { insertAdjacentHTML() { dom.inserted++; } };
+  const element = { querySelector(selector) { return selector === '.mes_text' ? text : panel; } };
+  r.context.document = { querySelector: () => element };
+  r.host.chat = [null, { mes: 'AI response', is_user: false }];
+  r.run(`
+    stripGodlogFromMessageRecord = () => false;
+    sanitizeLeakedGodlogDom = () => false;
+    renderInjectionBadgeForIndex = () => true;
+    globalThis.item = { key: row.key, status: 'pending', retryScheduledAt: Date.now() + 60000, error: 'old timeout' };
+    godlogForRow = () => item;
+    globalThis.prepared = { data: {}, rowsByIndex: new Map([[row.index, row]]) };
+    messageGodlogSummary = () => 'summary running'; messageGodlogBody = () => 'old timeout';
+    godlogStatusLabel = () => 'pending'; rememberMessageGodlogCard = () => false;
+  `);
+  return { ...r, dom };
+}
+
+test('existing pending/failed/ready summary cards stay hidden until the source completes', () => {
+  for (const status of ['pending', 'failed', 'ready', 'stale']) {
+    const r = panelRuntime();
+    r.context.status = status;
+    r.run(`item.status = status; state.generationLifecycleActive = true; state.forcedSummaryReruns.add(row.key);`);
+    assert.equal(r.run('renderGodlogPanelForIndex(row.index, prepared)'), true);
+    assert.equal(r.dom.inserted, 0);
+    assert.equal(r.dom.removed, 1);
+  }
+});
+
+test('summary card also waits for source settling, then appears after completion', () => {
+  const r = panelRuntime();
+  r.run('noteRowRevision(row, true);');
+  r.run('renderGodlogPanelForIndex(row.index, prepared)');
+  assert.equal(r.dom.inserted, 0);
+  r.advance(3000);
+  r.run('markRowFinalizedForGodlog(row); renderGodlogPanelForIndex(row.index, prepared);');
+  assert.equal(r.dom.inserted, 1);
+});
+
+test('a deferred manual request starts once only after the visible response finishes', async () => {
+  const r = withRow();
+  r.run(`
+    hasPersistentChatContext = () => true;
+    state.generationLifecycleActive = true;
+    globalThis.started = 0;
+    generateGodlogForRowUnlocked = async () => { started++; return true; };
+    scheduleGodlogPanelRender = () => {};
+    syncGodlogsWithChat = () => {};
+    invalidateRuntimeCaches = () => {};
+  `);
+  await r.run('generateGodlogForRow(row, true)');
+  assert.equal(r.run('started'), 0);
+  assert.equal(r.run('state.summaryTasks.size'), 0);
+  r.run("onGenerationFinished('正文完成'); onGenerationFinished('重复结束通知');");
+  assert.equal(r.calls.timers.size, 1);
+  [...r.calls.timers.values()][0].fn();
+  await Promise.resolve();
+  assert.equal(r.run('started'), 1);
+  assert.equal(r.run('state.forcedSummaryReruns.has(row.key)'), false);
 });

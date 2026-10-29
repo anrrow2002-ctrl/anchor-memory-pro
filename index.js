@@ -151,7 +151,16 @@ saveMetadataDebounced.flush = async () => {
   return undefined;
 };
 
+function visibleStreamIsActive() {
+  const stream = getContext().streamingProcessor || legacyScriptModule.streamingProcessor;
+  return !!stream && stream.type !== 'quiet' && stream.type !== 'impersonate'
+    && stream.isFinished === false && stream.isStopped !== true
+    && !stream.abortController?.signal?.aborted;
+}
+
 function hostGenerationState() {
+  // A live stream is stronger evidence than a send-button flag or an early UI end event.
+  if (visibleStreamIsActive()) return true;
   const ctx = getContext();
   if (typeof ctx.isGenerating === 'function') return !!ctx.isGenerating();
   if (typeof ctx.isGenerating === 'boolean') return ctx.isGenerating;
@@ -166,7 +175,7 @@ function isGenerationActive() {
 
 
 const MODULE = 'anchor_memory';
-const EXTENSION_VERSION = '1.1.4-rp.4';
+const EXTENSION_VERSION = '1.1.4-rp.5';
 const DATA_KEY = 'anchorMemory';
 const CORE_PROMPT_KEY = 'anchor_memory_core';
 const RECALL_PROMPT_KEY = 'anchor_memory_recall';
@@ -8927,6 +8936,14 @@ async function generateGodlogForRow(row, force = false) {
   if (!key) return false;
   if (isSummaryRowBusy(key)) return false;
   if (force && state.forcedSummaryReruns.has(key)) return false;
+  if (!settings().enabled || !hasPersistentChatContext() || row.role !== 'assistant') return false;
+  // Check before creating a running task or a pending record. Deferral is not an API request.
+  if (!isRowSettledForGodlog(row)) {
+    clearSummaryRetryTimer(key);
+    if (force) state.forcedSummaryReruns.add(key);
+    scheduleMemoryAfterSettle('正文完成后开始摘要', row, force);
+    return false;
+  }
 
   clearSummaryRetryTimer(key);
   const task = generateGodlogForRowUnlocked(row, force);
@@ -9055,7 +9072,8 @@ async function generateGodlogForRowUnlocked(row, force = false) {
       invalidateRuntimeCaches('summary source re-resolve');
       latestRow = currentRowForGodlog(item);
     }
-    if (!latestRow || latestRow.rawHash !== sourceHash || selectionSignature !== narrativeSourceSignature()) {
+    if (!latestRow || !isRowSettledForGodlog(latestRow)
+        || latestRow.rawHash !== sourceHash || selectionSignature !== narrativeSourceSignature()) {
       if (replacingCompleted) {
         item.rerunPending = false;
         item.rerunError = latestRow
@@ -10200,12 +10218,14 @@ function onGenerationStarted(type, _options, dryRun = false) {
   // the new generation an immediate-summary bypass before the new body is committed.
   const latest = observeLatestAssistantRow(true);
   if (latest?.key) state.finalizedRowHashes.delete(latest.key);
+  // Hide a previous card immediately when a floor is regenerated/continued.
+  scheduleGodlogPanelRender();
   // Do not cancel timers belonging to older edited floors. Their summaries are independent from
   // the newly starting visible generation.
 }
 
 function onGenerationFinished(source = '生成结束') {
-  if (!settings().enabled) return;
+  if (!settings().enabled || visibleStreamIsActive()) return;
   state.generationLifecycleActive = false;
   state.replacementTarget = null;
   state.generationEndedAt = Date.now();
@@ -10972,6 +10992,14 @@ function renderGodlogPanelForIndex(messageIndex, prepared = null) {
   const row = context.rowsByIndex?.get(index) || context.rows?.find(item => item.index === index);
   if (!row) return false;
 
+  // Existing pending/stale records must not expose a running/error card while this source is
+  // still streaming or settling. Treat hiding as a successful render so no retry loop is started.
+  if (!isRowSettledForGodlog(row)) {
+    messageEl.querySelector('.am-message-godlog-panel')?.remove();
+    renderInjectionBadgeForIndex(index, context);
+    return true;
+  }
+
   const data = context.data || memoryData();
   const item = godlogForRow(data, row);
   const hasExplicitQueuedRerun = state.forcedSummaryReruns.has(row.key);
@@ -10979,11 +11007,6 @@ function renderGodlogPanelForIndex(messageIndex, prepared = null) {
   // The card appears only once a real summary record/request exists, or when the user explicitly
   // queued a manual rerun. This keeps every new floor from looking permanently stuck in a queue.
   if (!item && !hasExplicitQueuedRerun) {
-    messageEl.querySelector('.am-message-godlog-panel')?.remove();
-    renderInjectionBadgeForIndex(index, context);
-    return true;
-  }
-  if (!item && generationIsActiveForGodlog(row)) {
     messageEl.querySelector('.am-message-godlog-panel')?.remove();
     renderInjectionBadgeForIndex(index, context);
     return true;
