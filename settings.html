@@ -410,7 +410,7 @@
           <label>主模型始终保留最近多少个AI回合原文
             <input id="am_keep_recent" class="text_pole" type="number" min="1" max="30" step="1" />
           </label>
-          <div class="am-note">记忆块固定放在聊天记录之后，避免每轮更新影响前面的提示词缓存。</div>
+          <div class="am-note">记忆块注入深度固定为 4（从最新消息往前数 4 条用户或 AI 消息）。聊天较短时自动调整，确保不会并入前置 system。</div>
         </div>
         <div class="am-note">
           默认每 15 个有效AI回合生成 1 个分段锚点；累计历史不再按AI回合数判断，而是默认每累计 3 个分段锚点合并一次。这样合并材料始终来自完整分段锚点，不会为了凑回合数在边界混入零散逐楼摘要。

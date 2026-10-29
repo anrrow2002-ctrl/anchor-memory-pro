@@ -166,7 +166,7 @@ function isGenerationActive() {
 
 
 const MODULE = 'anchor_memory';
-const EXTENSION_VERSION = '1.1.4-rp.3';
+const EXTENSION_VERSION = '1.1.4-rp.4';
 const DATA_KEY = 'anchorMemory';
 const CORE_PROMPT_KEY = 'anchor_memory_core';
 const RECALL_PROMPT_KEY = 'anchor_memory_recall';
@@ -336,7 +336,7 @@ const DEFAULT_SETTINGS = {
   anchorInterval: DEFAULT_ANCHOR_INTERVAL,
   mergeAnchorInterval: DEFAULT_MERGE_ANCHOR_INTERVAL,
   keepRecent: 3,
-  injectionDepth: 0,
+  injectionDepth: 4,
   autoHide: true,
   useSecondary: false,
   secondaryUrl: '',
@@ -495,9 +495,9 @@ function settings() {
       changed = true;
     }
   }
-  // Memory changes every turn: keep it after chat history, including for saved depth-4 installs.
-  if (s.injectionDepth !== 0) {
-    s.injectionDepth = 0;
+  // Restore the requested depth, including installations migrated to the tail in rp.3.
+  if (s.injectionDepth !== 4) {
+    s.injectionDepth = 4;
     changed = true;
   }
   const normalizedSecondaryPresets = normalizeSecondaryPresetList(s.secondaryPresets);
@@ -7851,12 +7851,17 @@ function pruneMessageUiIndexes(data, rows = chatRows(true)) {
 
 function resolvePromptInsertIndex(promptChat) {
   if (!Array.isArray(promptChat)) return 0;
-  // Never fall back to index 0 when compression leaves fewer than four messages.
-  // Keep trailing instructions after memory and complete tool exchanges before it.
-  for (let index = promptChat.length - 1; index >= 0; index--) {
-    if (['user', 'assistant', 'tool'].includes(promptChat[index]?.role)) return index + 1;
+  const turns = [];
+  for (let index = 0; index < promptChat.length; index++) {
+    if (['user', 'assistant'].includes(promptChat[index]?.role)) turns.push(index);
   }
-  return promptChat.length;
+  if (!turns.length) return promptChat.length;
+  // Depth 4 counts user/assistant messages from the end. On short/compressed histories, keep
+  // at least one chat message before memory so it cannot join the leading system prefix.
+  let position = Math.max(turns[0] + 1, turns[Math.max(0, turns.length - 4)]);
+  // The short-history clamp may land between an assistant tool call and its results.
+  while (position < promptChat.length && promptChat[position]?.role === 'tool') position++;
+  return position;
 }
 
 function isAnchorMemoryPromptMessage(message) {
@@ -8013,9 +8018,13 @@ async function injectMemory(chat = getContext().chat || [], options = {}) {
     commit,
     resolvedRecall: options.resolvedRecall || null,
   });
+  // Chat Completion owns the final insertion. Avoid a construction-stage copy that ST could
+  // squash into another system message before PROMPT_READY can reposition it.
+  const finalHookOwnsInjection = usesChatCompletionPromptReady()
+    && (getContext().mainApi || legacyScriptModule.main_api) === 'openai';
   setExtensionPrompt(
     CORE_PROMPT_KEY,
-    memoryPrompt,
+    finalHookOwnsInjection ? '' : memoryPrompt,
     extension_prompt_types.IN_CHAT,
     0,
     false,

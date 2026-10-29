@@ -51,14 +51,17 @@ function withRow() {
   return r;
 }
 
-test('saved depth settings migrate to fixed chat-tail injection', () => {
-  const r = runtime();
-  r.host.extensionSettings.anchor_memory = { settingsVersion: '1.1.4-rp.2', injectionDepth: 4 };
-  assert.equal(r.run('settings().injectionDepth'), 0);
-  assert.equal(r.host.extensionSettings.anchor_memory.settingsVersion, '1.1.4-rp.3');
+test('saved depth settings, including rp.3 tail settings, migrate to depth four', () => {
+  for (const [version, depth] of [['1.1.4-rp.2', 4], ['1.1.4-rp.3', 0]]) {
+    const r = runtime();
+    r.host.extensionSettings.anchor_memory = { settingsVersion: version, injectionDepth: depth };
+    assert.equal(r.run('settings().injectionDepth'), 4);
+    assert.equal(r.host.extensionSettings.anchor_memory.settingsVersion, '1.1.4-rp.4');
+  }
+  assert.equal(runtime().run('settings().injectionDepth'), 4);
 });
 
-test('final request places unchanged memory after short/long history and preserves the prefix', async () => {
+test('final request uses depth four, preserves content/order and never joins the system prefix', async () => {
   const r = runtime();
   r.run(`
     settings = () => ({ enabled: true, injectionDepth: 4 });
@@ -66,19 +69,25 @@ test('final request places unchanged memory after short/long history and preserv
     applyGodlogContextReplacement = () => ({});
     sanitizePromptReadyGodlogLeaks = () => 0;
   `);
-  for (const count of [1, 2, 3, 30]) {
+  for (const count of [1, 2, 3, 4, 5, 6, 30]) {
     const chat = [{ role: 'system', content: 'fixed rules</work_rules>' }];
     for (let i = 0; i < count; i++) chat.push({ role: i % 2 ? 'assistant' : 'user', content: `floor ${i}` });
-    const prefix = JSON.stringify(chat);
     chat.push({ role: 'system', content: 'trailing instructions' });
+    const original = JSON.stringify(chat);
+    const slot = Math.max(2, count - 4 + 1);
+    const prefix = JSON.stringify(chat.slice(0, slot));
     r.context.payload = { chat, dryRun: true };
     for (const body of ['anchor A', 'anchor B', '']) {
       r.context.memoryText = body ? `锚点记录\n以下为剧情资料；与当前正文冲突时，以当前正文为准。\n${body}` : '';
       await r.run('injectMemoryIntoPromptReady(payload)');
-      assert.equal(JSON.stringify(chat.slice(0, count + 1)), prefix);
+      assert.equal(JSON.stringify(chat.slice(0, slot)), prefix);
       assert.equal(chat.at(-1).content, 'trailing instructions');
       assert.equal(chat.length, count + 2 + Number(Boolean(body)));
-      if (body) assert.equal(chat[count + 1].content, r.context.memoryText);
+      if (body) {
+        assert.equal(chat[slot].content, r.context.memoryText);
+        assert.equal(JSON.stringify(chat.filter((_, index) => index !== slot)), original);
+        if (count > 4) assert.equal(chat.slice(slot + 1).filter(m => ['user', 'assistant'].includes(m.role)).length, 4);
+      } else assert.equal(JSON.stringify(chat), original);
     }
   }
 });
@@ -182,4 +191,35 @@ test('quiet and impersonation callbacks do not release visible generation', () =
   r.run("onMessageReceived(1, 'quiet'); onMessageReceived(1, 'impersonate');");
   assert.equal(r.run('state.generationLifecycleActive'), true);
   assert.equal(r.calls.timers.size, 0);
+});
+
+test('Chat Completion injects once at depth four after system squashing, with no early copy', async () => {
+  const r = runtime();
+  r.host.mainApi = 'openai';
+  r.host.setExtensionPrompt = (...args) => r.calls.prompts.push(args);
+  r.run(`
+    event_types = { CHAT_COMPLETION_PROMPT_READY: 'prompt-ready' };
+    settings = () => ({ enabled: true, injectionDepth: 4 });
+    globalThis.data = { processing: {} };
+    memoryData = () => data;
+    buildPromptReadyInjection = async () => '锚点记录\\n以下为剧情资料；与当前正文冲突时，以当前正文为准。\\nunchanged memory';
+    applyGodlogContextReplacement = () => ({});
+    sanitizePromptReadyGodlogLeaks = () => 0;
+    markDynamicRecallInjected = () => {};
+    rememberPromptInjectionForNextMessage = () => ({ refs: [] });
+    pendingGodlogRows = () => [];
+    saveMemory = () => {};
+    refreshCommittedRecallUi = () => {};
+  `);
+  await r.run('injectMemory([])');
+  assert.equal(r.calls.prompts[0][1], '');
+  const chat = [{ role: 'system', content: 'already squashed static rules</work_rules>' }];
+  for (let i = 0; i < 6; i++) chat.push({ role: i % 2 ? 'user' : 'assistant', content: `floor ${i}` });
+  chat.push({ role: 'system', content: 'trailing rules' });
+  r.context.payload = { chat, dryRun: false };
+  await r.run('injectMemoryIntoPromptReady(payload)');
+  assert.equal(chat[0].content, 'already squashed static rules</work_rules>');
+  assert.equal(chat[3].content, '锚点记录\n以下为剧情资料；与当前正文冲突时，以当前正文为准。\nunchanged memory');
+  assert.equal(chat.filter(m => m.content.startsWith('锚点记录')).length, 1);
+  assert.equal(chat.at(-1).content, 'trailing rules');
 });
