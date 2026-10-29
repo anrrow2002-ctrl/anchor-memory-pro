@@ -70,11 +70,12 @@ let warnedMissingPromptApi = false;
 
 async function loadLegacyRuntimeFallbacks() {
   // Namespace imports never fail merely because one named export moved/vanished.
-  // They are only needed on old ST builds that do not expose SillyTavern.getContext().
-  if (globalThis.SillyTavern?.getContext) return;
+  // Context/settings fallbacks are only needed on older ST builds.
+  // Modern contexts do not always expose isGenerating. Read the live host flag too.
   try { legacyScriptModule = await import('../../../../script.js'); } catch (err) {
     console.warn('[AnchorMemory] legacy script.js fallback unavailable', err);
   }
+  if (globalThis.SillyTavern?.getContext) return;
   try { legacyExtensionsModule = await import('../../../extensions.js'); } catch (err) {
     console.warn('[AnchorMemory] legacy extensions.js fallback unavailable', err);
   }
@@ -150,16 +151,22 @@ saveMetadataDebounced.flush = async () => {
   return undefined;
 };
 
-function isGenerationActive() {
+function hostGenerationState() {
   const ctx = getContext();
   if (typeof ctx.isGenerating === 'function') return !!ctx.isGenerating();
+  if (typeof ctx.isGenerating === 'boolean') return ctx.isGenerating;
   if (typeof legacyScriptModule.isGenerating === 'function') return !!legacyScriptModule.isGenerating();
-  return !!legacyScriptModule.is_send_press;
+  if (typeof legacyScriptModule.is_send_press === 'boolean') return legacyScriptModule.is_send_press;
+  return null;
+}
+
+function isGenerationActive() {
+  return hostGenerationState() === true;
 }
 
 
 const MODULE = 'anchor_memory';
-const EXTENSION_VERSION = '1.1.4-rp.2';
+const EXTENSION_VERSION = '1.1.4-rp.3';
 const DATA_KEY = 'anchorMemory';
 const CORE_PROMPT_KEY = 'anchor_memory_core';
 const RECALL_PROMPT_KEY = 'anchor_memory_recall';
@@ -329,7 +336,7 @@ const DEFAULT_SETTINGS = {
   anchorInterval: DEFAULT_ANCHOR_INTERVAL,
   mergeAnchorInterval: DEFAULT_MERGE_ANCHOR_INTERVAL,
   keepRecent: 3,
-  injectionDepth: 4,
+  injectionDepth: 0,
   autoHide: true,
   useSecondary: false,
   secondaryUrl: '',
@@ -487,6 +494,11 @@ function settings() {
       s[key] = value;
       changed = true;
     }
+  }
+  // Memory changes every turn: keep it after chat history, including for saved depth-4 installs.
+  if (s.injectionDepth !== 0) {
+    s.injectionDepth = 0;
+    changed = true;
   }
   const normalizedSecondaryPresets = normalizeSecondaryPresetList(s.secondaryPresets);
   if (JSON.stringify(s.secondaryPresets || []) !== JSON.stringify(normalizedSecondaryPresets)) {
@@ -3016,7 +3028,7 @@ function blockedRebuildGodlogRows(data) {
 }
 
 function anchorMaterialForRow(data, row, rows = chatRows(true)) {
-  if (isReplacementSource(row)) return null;
+  if (isReplacementSource(row) || !isRowSettledForGodlog(row)) return null;
   const godlog = godlogForRow(data, row);
   if (isGodlogReady(godlog, row)) return { row, godlog, mode: 'godlog' };
   // A failed/pending summary must not permanently freeze every later 15-turn anchor. Keep the
@@ -3097,6 +3109,8 @@ function missingGodlogDiagnostics(data) {
   const rows = chatRows(true).filter(row => row.role === 'assistant');
   return rows
     .map((row, index) => {
+      // An unfinished response is expected to have no summary; it is not a repair failure.
+      if (!isRowSettledForGodlog(row)) return null;
       const item = godlogForRow(data, row);
       if (isGodlogReady(item, row)) return null;
       const newerAssistantCount = rows.length - index - 1;
@@ -3176,7 +3190,7 @@ function maybeWarnMissingGodlogs(data = memoryData()) {
   }
 
   const signature = issues
-    .map(({ row, item, status }) => `${row.key}:${row.rawHash}:${status}:${item?.retryCount || 0}:${item?.error || ''}`)
+    .map(({ row, item, status }) => `${row.key}:${status}:${item?.retryCount || 0}:${item?.error || ''}`)
     .join('|');
   const now = Date.now();
   if (
@@ -7835,28 +7849,14 @@ function pruneMessageUiIndexes(data, rows = chatRows(true)) {
   return changed;
 }
 
-function normalizedInjectionDepth(value = settings().injectionDepth) {
-  const numeric = Number(value);
-  return Number.isFinite(numeric) ? Math.max(0, Math.floor(numeric)) : 4;
-}
-
-function resolvePromptInsertIndex(promptChat, depth = 4) {
-  if (!Array.isArray(promptChat) || promptChat.length === 0) return 0;
-  const position = Math.max(0, Number(depth) || 0);
-  if (position === 0) {
-    for (let index = promptChat.length - 1; index >= 0; index--) {
-      if (promptChat[index]?.role === 'user' || promptChat[index]?.role === 'assistant') return index + 1;
-    }
-    return promptChat.length;
-  }
-
-  let turns = 0;
+function resolvePromptInsertIndex(promptChat) {
+  if (!Array.isArray(promptChat)) return 0;
+  // Never fall back to index 0 when compression leaves fewer than four messages.
+  // Keep trailing instructions after memory and complete tool exchanges before it.
   for (let index = promptChat.length - 1; index >= 0; index--) {
-    if (promptChat[index]?.role !== 'user' && promptChat[index]?.role !== 'assistant') continue;
-    turns++;
-    if (turns >= position) return index;
+    if (['user', 'assistant', 'tool'].includes(promptChat[index]?.role)) return index + 1;
   }
-  return 0;
+  return promptChat.length;
 }
 
 function isAnchorMemoryPromptMessage(message) {
@@ -7963,7 +7963,7 @@ async function injectMemoryIntoPromptReady(eventData, secondArg = false) {
     removeExistingAnchorMemoryPrompt(promptChat);
     let promptRecord = null;
     if (String(content || '').trim()) {
-      const insertIndex = resolvePromptInsertIndex(promptChat, normalizedInjectionDepth(s.injectionDepth));
+      const insertIndex = resolvePromptInsertIndex(promptChat);
       promptChat.splice(insertIndex, 0, { role: 'system', content });
       sanitizePromptReadyGodlogLeaks(promptChat);
       if (!dryRun) {
@@ -8017,7 +8017,7 @@ async function injectMemory(chat = getContext().chat || [], options = {}) {
     CORE_PROMPT_KEY,
     memoryPrompt,
     extension_prompt_types.IN_CHAT,
-    normalizedInjectionDepth(s.injectionDepth),
+    0,
     false,
     extension_prompt_roles.SYSTEM,
   );
@@ -9665,7 +9665,7 @@ async function createAnchorUnlocked(force = false, customMaterials = null, inter
   }
   if (materials.some(item => {
     const live = rowByStableKey(item.row?.key);
-    return !live || isReplacementSource(live) || live.rawHash !== item.row.rawHash
+    return !live || isReplacementSource(live) || !isRowSettledForGodlog(live) || live.rawHash !== item.row.rawHash
       || (item.mode !== 'raw-fallback' && !isGodlogReady(item.godlog, live));
   })) return false;
 
@@ -10047,11 +10047,9 @@ function generationIsActiveForGodlog(row = null) {
   const latestOnly = row ? isLatestAssistantRow(row) : true;
   if (!latestOnly) return false;
   if (isGenerationActive()) return true;
-  // Lifecycle events are only a short fallback. A missed end event must never block the queue for
-  // minutes, and background/quiet API streaming must not masquerade as the visible AI generation.
-  if (state.generationLifecycleActive && Date.now() - state.generationStartedAt < 30 * 1000) return true;
-  if (state.generationLifecycleActive) state.generationLifecycleActive = false;
-  return false;
+  // A slow response or long reasoning pause is still in flight. Only completion/stop (or a
+  // chat reset) releases the visible lifecycle lock; elapsed time is never proof of completion.
+  return state.generationLifecycleActive;
 }
 
 function rowSettleDelay(row) {
@@ -10113,6 +10111,8 @@ function scheduleMemoryAfterSettle(source = '等待当前楼正文稳定', row =
   const forced = !!forceSummaryRerun || (!!targetKey && state.forcedSummaryReruns.has(targetKey));
   const timerKey = settleTimerKey(target);
   cancelSettleTimer(target);
+  // Completion events will requeue this row. Do not poll or start memory work while streaming.
+  if (target && state.generationLifecycleActive && generationIsActiveForGodlog(target)) return;
   // IMPORTANT: a settled row legitimately returns 0. Do not use `|| GODLOG_SOURCE_SETTLE_MS` here:
   // that converted the valid zero into another 1800ms wait and made completed generations feel laggy.
   const measuredDelay = target ? rowSettleDelay(target) : GODLOG_SOURCE_SETTLE_MS;
@@ -10371,6 +10371,7 @@ function statusText(data = memoryData()) {
   if (data.processing?.queueRunning || state.summaryRunning || state.running || state.mergeRunning) {
     return `${name}：正在整理记忆；完成后会自动继续下一步。`;
   }
+  if (generationIsActiveForGodlog(latestAssistantRow())) return `${name}：当前正文仍在生成，完成后自动整理记忆。`;
   if (pendingSummaries > 0) return `${name}：还有 ${pendingSummaries} 楼等待生成摘要；补齐后会自动继续锚定。`;
   if (mergeReady) return `${name}：分段锚点已达到合并条件，等待写入累计历史。`;
   if (continuousReady >= anchorInterval || anchorRemaining === 0) return `${name}：已到锚点边界，等待生成下一个分段锚点。`;
@@ -13172,7 +13173,6 @@ function loadUi() {
   $('#am_anchor_interval').val(s.anchorInterval);
   $('#am_merge_anchor_interval').val(s.mergeAnchorInterval);
   $('#am_keep_recent').val(s.keepRecent);
-  $('#am_injection_depth').val(s.injectionDepth);
   $('#am_adaptive_token_budget').prop('checked', !!s.adaptiveTokenBudget);
   $('#am_memory_max_tokens').val(s.memoryMaxTokens);
   $('#am_memory_reserve_tokens').val(s.memoryReserveTokens);
@@ -13267,7 +13267,6 @@ function bindUi() {
     saveSetting('keepRecent', Math.max(1, Number(this.value) || 3));
     reconcileStrictRecentWindow('保留轮数设置已变化').catch(console.warn);
   });
-  $('#am_injection_depth').on('change', function () { saveSetting('injectionDepth', normalizedInjectionDepth(this.value)); });
   $('#am_adaptive_token_budget').on('change', function () { saveSetting('adaptiveTokenBudget', this.checked); injectMemory().catch(console.warn); });
   $('#am_memory_max_tokens').on('change', function () { saveSetting('memoryMaxTokens', Math.max(1200, Math.min(32000, Number(this.value) || 8000))); injectMemory().catch(console.warn); });
   $('#am_memory_reserve_tokens').on('change', function () { saveSetting('memoryReserveTokens', Math.max(600, Math.min(16000, Number(this.value) || 1400))); injectMemory().catch(console.warn); });
@@ -13574,8 +13573,15 @@ function onStreamTokenReceived() {
   }, STREAM_TAIL_PROBE_MS);
 }
 
-function onMessageReceived() {
-  if (!settings().enabled) return;
+function onMessageReceived(_messageId, type) {
+  if (!settings().enabled || type === 'quiet' || type === 'impersonate') return;
+  // Some hosts miss GENERATION_ENDED. A committed message plus an explicitly idle host is
+  // another completion signal; an unavailable host flag must not unlock a live response.
+  if (state.generationLifecycleActive && hostGenerationState() === false) {
+    state.generationLifecycleActive = false;
+    state.replacementTarget = null;
+    state.generationEndedAt = Date.now();
+  }
   if (state.streamProbeTimer) clearTimeout(state.streamProbeTimer);
   state.streamProbeTimer = null;
   invalidateRuntimeCaches('message received');
