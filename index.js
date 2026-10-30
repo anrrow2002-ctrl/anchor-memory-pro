@@ -175,7 +175,7 @@ function isGenerationActive() {
 
 
 const MODULE = 'anchor_memory';
-const EXTENSION_VERSION = '1.1.4-rp.5';
+const EXTENSION_VERSION = '1.1.4-rp.6';
 const DATA_KEY = 'anchorMemory';
 const CORE_PROMPT_KEY = 'anchor_memory_core';
 const RECALL_PROMPT_KEY = 'anchor_memory_recall';
@@ -7858,17 +7858,56 @@ function pruneMessageUiIndexes(data, rows = chatRows(true)) {
   return changed;
 }
 
+function resolvePromptHistoryIndices(promptChat) {
+  const ctx = getContext();
+  const contextChat = Array.isArray(ctx.chat) ? ctx.chat : [];
+  const completionSettings = ctx.chatCompletionSettings || {};
+  const chatMarkers = new Set();
+  for (const value of [completionSettings.new_chat_prompt, completionSettings.new_group_chat_prompt]) {
+    if (typeof value !== 'string' || !value.trim()) continue;
+    // Boundary detection must not reroll random macros or write variables a second time.
+    const macros = [...value.matchAll(/\{\{([\s\S]*?)\}\}/g)];
+    if (macros.some(([, name]) => !/^(?:char|user|group)$/i.test(name.trim()))) continue;
+    const expanded = macros.length && typeof ctx.substituteParams === 'function' ? ctx.substituteParams(value) : value;
+    const marker = normalizePromptBody(expanded);
+    if (marker) chatMarkers.add(marker);
+  }
+  const cache = buildOutboundSearchCache(promptChat);
+  // ST keeps newMainChat separate when squashing system prompts. Exclude example dialogue and
+  // assistant-role presets before this boundary, even if they repeat a real chat message.
+  let cursor = 0;
+  for (const entry of cache.entries) {
+    if (promptChat[entry.index]?.identifier === 'newMainChat'
+        || (entry.role === 'system' && chatMarkers.has(entry.normalized))) cursor = entry.index + 1;
+  }
+  const turns = [];
+  const historyPlan = recentRawHistoryPlan(contextChat);
+  for (const sourceIndex of historyPlan.keepIndices) {
+    const message = contextChat[sourceIndex];
+    if (!isNarrativeMessage(message)) continue;
+    const source = normalizePromptBody(message?.mes || '');
+    if (!source) continue;
+    const role = messageRole(message);
+    // Match in history order, accepting whole-body wrappers at the same priority as exact text.
+    // Otherwise a later lastUserMessage macro could win over the real, wrapped user floor.
+    const entry = cache.entries.find(entry => entry.index >= cursor && entry.role === role
+      && (entry.normalized === source || (source.length >= 30 && entry.normalized.includes(source))));
+    if (!entry) continue;
+    turns.push(entry.index);
+    cursor = entry.index + 1;
+  }
+  return turns;
+}
+
 function resolvePromptInsertIndex(promptChat) {
   if (!Array.isArray(promptChat)) return 0;
-  const turns = [];
-  for (let index = 0; index < promptChat.length; index++) {
-    if (['user', 'assistant'].includes(promptChat[index]?.role)) turns.push(index);
-  }
+  const turns = resolvePromptHistoryIndices(promptChat);
+  // Never infer history from role alone: presets can use user/assistant too. If another extension
+  // rewrote every source beyond recognition, appending is safer than moving memory into setup.
   if (!turns.length) return promptChat.length;
-  // Depth 4 counts user/assistant messages from the end. On short/compressed histories, keep
-  // at least one chat message before memory so it cannot join the leading system prefix.
+  // D4 counts only real history still present after pruning. Short/compressed requests keep at
+  // least their first real floor before memory; trailing preset instructions do not affect depth.
   let position = Math.max(turns[0] + 1, turns[Math.max(0, turns.length - 4)]);
-  // The short-history clamp may land between an assistant tool call and its results.
   while (position < promptChat.length && promptChat[position]?.role === 'tool') position++;
   return position;
 }
